@@ -18,10 +18,131 @@ from src.models import PipelineState, PipelineStage
 
 st.set_page_config(
     page_title="Virtual FDE — Fairshot",
-    page_icon="🔌",
+    page_icon="app/static/logo.jpeg",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ─── Fairshot Brand CSS ──────────────────────────────────────────────────
+
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap');
+
+    /* Global font */
+    html, body, [class*="css"] {
+        font-family: 'Figtree', sans-serif;
+    }
+
+    /* Main background */
+    .stApp {
+        background-color: #0D0D0D;
+    }
+
+    /* Sidebar styling */
+    section[data-testid="stSidebar"] {
+        background-color: #1A1A1A;
+        border-right: 1px solid #2A2A2A;
+    }
+
+    /* Purple accent for headers */
+    h1, h2, h3 {
+        font-family: 'Figtree', sans-serif !important;
+        font-weight: 700 !important;
+    }
+
+    /* Primary button — Fairshot purple gradient */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #814AC8, #DF7AFE) !important;
+        border: none !important;
+        color: white !important;
+        font-family: 'Figtree', sans-serif !important;
+        font-weight: 600 !important;
+        border-radius: 8px !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background: linear-gradient(135deg, #986AD4, #DF7AFE) !important;
+        box-shadow: 0 0 20px rgba(129, 74, 200, 0.4) !important;
+    }
+
+    /* Secondary button */
+    .stButton > button[kind="secondary"] {
+        border: 1px solid #814AC8 !important;
+        color: #DF7AFE !important;
+        background: transparent !important;
+        font-family: 'Figtree', sans-serif !important;
+        border-radius: 8px !important;
+    }
+
+    /* Metric cards */
+    [data-testid="stMetric"] {
+        background-color: #1A1A1A;
+        border: 1px solid #2A2A2A;
+        border-radius: 10px;
+        padding: 12px 16px;
+    }
+    [data-testid="stMetricValue"] {
+        color: #FFFFFF !important;
+        font-family: 'Figtree', sans-serif !important;
+    }
+    [data-testid="stMetricLabel"] {
+        color: #999999 !important;
+    }
+
+    /* Expander styling */
+    .streamlit-expanderHeader {
+        background-color: #1A1A1A !important;
+        border-radius: 8px !important;
+        font-family: 'Figtree', sans-serif !important;
+    }
+
+    /* Progress bar — purple */
+    .stProgress > div > div > div {
+        background: linear-gradient(90deg, #814AC8, #DF7AFE) !important;
+    }
+
+    /* Divider */
+    hr {
+        border-color: #2A2A2A !important;
+    }
+
+    /* Code blocks */
+    .stCodeBlock {
+        border: 1px solid #2A2A2A !important;
+        border-radius: 8px !important;
+    }
+
+    /* Success/warning/error boxes */
+    .stAlert {
+        border-radius: 8px !important;
+    }
+
+    /* Selectbox */
+    .stSelectbox [data-baseweb="select"] {
+        border-radius: 8px !important;
+    }
+
+    /* Logo container in sidebar */
+    .sidebar-logo {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 0;
+        margin-bottom: 8px;
+    }
+    .sidebar-logo img {
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+    }
+    .sidebar-logo span {
+        font-family: 'Figtree', sans-serif;
+        font-weight: 700;
+        font-size: 1.3rem;
+        color: #FFFFFF;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ─── Session State Init ─────────────────────────────────────────────────
 
@@ -79,8 +200,24 @@ def _run_drift_in_thread(schema_name: str):
 # ─── Sidebar ─────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("⚡ Virtual FDE")
-    st.caption("Enterprise Integration Concierge")
+    import base64
+    import os
+
+    logo_path = os.path.join(os.path.dirname(__file__), "static", "logo.jpeg")
+    if os.path.exists(logo_path):
+        with open(logo_path, "rb") as f:
+            logo_b64 = base64.b64encode(f.read()).decode()
+        st.markdown(
+            f'<div class="sidebar-logo">'
+            f'<img src="data:image/jpeg;base64,{logo_b64}" />'
+            f'<span>Fairshot</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.header("Fairshot")
+
+    st.caption("Virtual FDE — Enterprise Integration Concierge")
     st.divider()
 
     schema_choice = st.selectbox(
@@ -155,7 +292,12 @@ with st.sidebar:
 
 # ─── Main Title ──────────────────────────────────────────────────────────
 
-st.title("Virtual FDE")
+st.markdown(
+    '<h1 style="background: linear-gradient(135deg, #814AC8, #DF7AFE); '
+    '-webkit-background-clip: text; -webkit-text-fill-color: transparent; '
+    'font-size: 2.5rem; margin-bottom: 0;">Virtual FDE</h1>',
+    unsafe_allow_html=True,
+)
 st.caption("Autonomous ATS → Fairshot integration in under 60 seconds")
 
 # ─── Progress Bar ────────────────────────────────────────────────────────
@@ -327,6 +469,6 @@ with st.expander("📋 Event Log", expanded=not st.session_state["pipeline_compl
 
 # ─── Auto-refresh while running ─────────────────────────────────────────
 
-if st.session_state["pipeline_running"]:
+if st.session_state["pipeline_running"] or st.session_state.get("drift_running", False):
     time.sleep(1.5)
     st.rerun()

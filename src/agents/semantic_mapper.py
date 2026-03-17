@@ -198,5 +198,5 @@ def create_semantic_mapper() -> Agent:
         instructions=SEMANTIC_MAPPER_INSTRUCTIONS,
         tools=[load_fairshot_spec, get_schema_summary, get_field_samples],
         output_type=MappingDocument,
-        model="gpt-4o",
+        model="gpt-5.3-codex",
     )

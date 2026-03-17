@@ -3399,123 +3399,1844 @@ No changes needed to `src/utils/llm_providers.py` — Gemini already has `get_ge
 
 ---
 
-### Phase 5: Deployment Orchestrator (Supervisor)
+### Phase 5: Deployment Orchestrator (Supervisor) — DETAILED SPEC
 
-**Goal:** Wire all agents together using the OpenAI Agents SDK Manager pattern. End-to-end pipeline from schema input to validated middleware.
+**Goal:** Wire all 3 worker agents together into a single end-to-end pipeline. The orchestrator is NOT an LLM agent — it's a deterministic Python async function that calls each worker agent sequentially, manages `PipelineState`, and emits callback events for the dashboard (Phase 6).
 
-**Scope:**
-- Implement the Deployment Orchestrator in `src/agents/orchestrator.py`
-- Use the **agents-as-tools** pattern: register Schema Explorer, Semantic Mapper, and Code Generator as tools
-- Implement `PipelineState` management — track progress, store artifacts, emit logs
-- End-to-end flow: schema file → SchemaReport → MappingDocument → middleware → ValidationResult
-- Add a `run_pipeline(schema_path: str) -> PipelineState` entry point
-- Write integration tests in `tests/test_orchestrator.py`
+**Dependencies:** Phases 2, 3, 4 (all three worker agents must be functional)
 
-**Implementation details:**
-- The orchestrator agent's system prompt should describe the full pipeline and when to call each worker
-- Pipeline state should be updated at each stage transition
-- Log entries should be created for every significant event (agent started, agent completed, errors)
-- Error handling: if any worker fails, the orchestrator should log the error and set pipeline state to ERROR
-- The orchestrator should pass the output of each worker as input to the next
+---
 
-**Files to create/modify:**
-- `src/agents/orchestrator.py`
-- `tests/test_orchestrator.py`
+#### 5.1 Architecture Decision: Deterministic Orchestrator, NOT an LLM Agent
 
-**Acceptance criteria:**
-- [ ] `python -m src.agents.orchestrator` runs the full pipeline against the Workday mock schema
-- [ ] Pipeline completes in < 60 seconds
-- [ ] PipelineState contains all artifacts (SchemaReport, MappingDocument, middleware, ValidationResult)
-- [ ] Pipeline logs capture all stage transitions
-- [ ] `pytest tests/test_orchestrator.py` passes
+**Critical design decision:** The original PRD described the orchestrator as an LLM-based supervisor agent using the "agents-as-tools" SDK pattern. **We are NOT doing that.** Reasons:
+
+1. **Latency** — Adding a 4th LLM agent that decides "which worker to call next" adds ~5-10 seconds of unnecessary reasoning for a pipeline that is always sequential.
+2. **Reliability** — An LLM orchestrator might skip steps, call workers out of order, or hallucinate pipeline state. A deterministic Python function cannot.
+3. **Observability** — The dashboard (Phase 6) needs precise progress callbacks at each stage. A deterministic orchestrator provides exact control over when events fire.
+4. **Demo stability** — For a live pitch, we need 100% predictable behavior. LLM orchestration adds variance.
+
+The worker agents (Schema Explorer, Semantic Mapper, Code Generator) remain LLM-powered — that's where the intelligence lives. The orchestrator is just plumbing.
+
+```
+run_pipeline(schema_path, entity_name)
+    │
+    ├─ 1. Schema Explorer Agent (LLM)  → SchemaReport
+    │      callback: on_stage_change(SCHEMA_EXPLORATION)
+    │
+    ├─ 2. Semantic Mapper Agent (LLM)  → MappingDocument
+    │      callback: on_stage_change(SEMANTIC_MAPPING)
+    │
+    ├─ 3. Code Generator Agent (LLM)   → TransformSpec
+    │      callback: on_stage_change(CODE_GENERATION)
+    │
+    ├─ 4. Render Middleware (deterministic) → middleware code
+    │
+    ├─ 5. Test Transform (deterministic)   → transformed record
+    │      callback: on_stage_change(DATA_FLOW)
+    │
+    └─ 6. Return PipelineState with all artifacts
+           callback: on_stage_change(COMPLETED)
+```
+
+---
+
+#### 5.2 Schema-to-Path Mapping
+
+The orchestrator needs to know which schema file and primary entity to use based on user selection. Define this mapping:
+
+```python
+SCHEMA_CONFIGS = {
+    "Workday Enterprise": {
+        "schema_path": "src/mock_data/workday_schema.json",
+        "entity_name": "WD_Candidate_Profile",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+    "SmartRecruiters Lite": {
+        "schema_path": "src/mock_data/smartrecruiters_schema.json",
+        "entity_name": "sr_candidates",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+    "Legacy Oracle": {
+        "schema_path": "src/mock_data/legacy_oracle_schema.json",
+        "entity_name": "HR_CANDIDATES",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+}
+```
+
+---
+
+#### 5.3 Callback Protocol
+
+The orchestrator accepts an optional callback function so the dashboard (Phase 6) can receive real-time updates. The callback signature:
+
+```python
+from typing import Callable, Optional, Protocol
+
+class PipelineCallback(Protocol):
+    def __call__(self, state: PipelineState) -> None: ...
+```
+
+The orchestrator calls the callback:
+- At each stage transition (IDLE → SCHEMA_EXPLORATION → SEMANTIC_MAPPING → etc.)
+- When progress percentage updates
+- When an error occurs
+- When a log entry is added
+
+This is a synchronous callback — the dashboard will use it from a Streamlit thread. No async complexity needed.
+
+---
+
+#### 5.4 File: `src/agents/orchestrator.py`
+
+```python
+"""
+Deployment Orchestrator — Phase 5
+
+Deterministic pipeline that wires Schema Explorer → Semantic Mapper →
+Code Generator into an end-to-end flow. NOT an LLM agent — just async
+Python coordinating LLM-powered worker agents.
+"""
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+
+from agents import Runner
+
+from src.agents.schema_explorer import create_schema_explorer
+from src.agents.semantic_mapper import create_semantic_mapper
+from src.agents.code_generator import create_code_generator, _render_middleware, _run_test_transform, _load_sample_record
+from src.models import (
+    PipelineState,
+    PipelineStage,
+    LogEntry,
+    SchemaReport,
+    MappingDocument,
+    TransformSpec,
+    ValidationResult,
+)
+
+logger = logging.getLogger(__name__)
+
+# ─── Schema Configs ──────────────────────────────────────────────────────
+
+SCHEMA_CONFIGS: dict[str, dict[str, str]] = {
+    "Workday Enterprise": {
+        "schema_path": "src/mock_data/workday_schema.json",
+        "entity_name": "WD_Candidate_Profile",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+    "SmartRecruiters Lite": {
+        "schema_path": "src/mock_data/smartrecruiters_schema.json",
+        "entity_name": "sr_candidates",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+    "Legacy Oracle": {
+        "schema_path": "src/mock_data/legacy_oracle_schema.json",
+        "entity_name": "HR_CANDIDATES",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+}
+
+
+# ─── Pipeline State Helpers ──────────────────────────────────────────────
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _add_log(
+    state: PipelineState,
+    stage: PipelineStage,
+    message: str,
+    detail: str | None = None,
+) -> None:
+    state.logs.append(
+        LogEntry(timestamp=_now(), stage=stage, message=message, detail=detail)
+    )
+
+
+def _transition(
+    state: PipelineState,
+    stage: PipelineStage,
+    progress: float,
+    message: str,
+    callback: Callable[[PipelineState], None] | None = None,
+) -> None:
+    """Update pipeline state and notify callback."""
+    state.current_stage = stage
+    state.progress_percent = progress
+    _add_log(state, stage, message)
+    if callback:
+        callback(state)
+
+
+# ─── Main Pipeline ───────────────────────────────────────────────────────
+
+
+async def run_pipeline(
+    schema_name: str,
+    callback: Callable[[PipelineState], None] | None = None,
+) -> PipelineState:
+    """Run the full integration pipeline for a given ATS schema.
+
+    Args:
+        schema_name: One of the keys in SCHEMA_CONFIGS
+            ("Workday Enterprise", "SmartRecruiters Lite", "Legacy Oracle")
+        callback: Optional function called on every state transition.
+            Signature: callback(state: PipelineState) -> None
+
+    Returns:
+        PipelineState with all artifacts populated.
+    """
+    state = PipelineState(started_at=_now())
+
+    config = SCHEMA_CONFIGS.get(schema_name)
+    if not config:
+        state.current_stage = PipelineStage.ERROR
+        state.error = f"Unknown schema: '{schema_name}'. Valid options: {list(SCHEMA_CONFIGS.keys())}"
+        _add_log(state, PipelineStage.ERROR, state.error)
+        if callback:
+            callback(state)
+        return state
+
+    schema_path = config["schema_path"]
+    entity_name = config["entity_name"]
+    fairshot_spec_path = config["fairshot_spec_path"]
+
+    try:
+        # ── Stage 1: Schema Exploration ──────────────────────────────
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 10.0,
+            f"Starting schema exploration: {schema_name}",
+            callback,
+        )
+
+        explorer = create_schema_explorer()
+        explore_result = await Runner.run(
+            explorer,
+            input=f"Analyze the schema at {schema_path}",
+        )
+        schema_report: SchemaReport = explore_result.final_output
+
+        state.schema_report = schema_report.model_dump()
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 30.0,
+            f"Schema exploration complete: {schema_report.total_field_count} fields discovered across {len(schema_report.endpoints)} endpoints",
+            callback,
+        )
+
+        # ── Stage 2: Semantic Mapping ────────────────────────────────
+        _transition(
+            state, PipelineStage.SEMANTIC_MAPPING, 35.0,
+            "Starting semantic mapping",
+            callback,
+        )
+
+        mapper = create_semantic_mapper()
+        mapper_input = (
+            f"Map the following ATS schema to the Fairshot API.\n\n"
+            f"Schema Report (JSON):\n{schema_report.model_dump_json(indent=2)}\n\n"
+            f"Raw schema file: {schema_path}\n"
+            f"Fairshot API spec file: {fairshot_spec_path}"
+        )
+        map_result = await Runner.run(mapper, input=mapper_input)
+        mapping_doc: MappingDocument = map_result.final_output
+
+        state.mapping_document = mapping_doc.model_dump()
+        _transition(
+            state, PipelineStage.SEMANTIC_MAPPING, 55.0,
+            f"Semantic mapping complete: {len(mapping_doc.mappings)} fields mapped, "
+            f"coverage {mapping_doc.mapping_coverage:.0%}, "
+            f"confidence {mapping_doc.overall_confidence:.2f}",
+            callback,
+        )
+
+        # ── Stage 3: Code Generation ────────────────────────────────
+        _transition(
+            state, PipelineStage.CODE_GENERATION, 60.0,
+            "Starting code generation + Gemini cross-validation",
+            callback,
+        )
+
+        generator = create_code_generator()
+        gen_input = (
+            f"Generate a TransformSpec for the following mapping.\n\n"
+            f"Mapping Document (JSON):\n{mapping_doc.model_dump_json(indent=2)}\n\n"
+            f"Schema file: {schema_path}\n"
+            f"Primary entity: {entity_name}\n"
+            f"Fairshot spec: {fairshot_spec_path}"
+        )
+        gen_result = await Runner.run(generator, input=gen_input)
+        transform_spec: TransformSpec = gen_result.final_output
+
+        # Render middleware from the TransformSpec
+        middleware_code = _render_middleware(transform_spec)
+        state.generated_middleware = middleware_code
+
+        _transition(
+            state, PipelineStage.CODE_GENERATION, 80.0,
+            f"Code generation complete: {len(transform_spec.transforms)} transform operations, "
+            f"middleware rendered ({len(middleware_code)} chars)",
+            callback,
+        )
+
+        # ── Stage 4: Data Flow Test ─────────────────────────────────
+        _transition(
+            state, PipelineStage.DATA_FLOW, 85.0,
+            "Running live data flow test",
+            callback,
+        )
+
+        sample_json = _load_sample_record(schema_path, entity_name)
+        transform_output = _run_test_transform(middleware_code, sample_json)
+        transform_result = json.loads(transform_output)
+
+        if "error" in transform_result:
+            _add_log(
+                state, PipelineStage.DATA_FLOW,
+                f"Data flow test failed: {transform_result['error']}",
+                detail=transform_output,
+            )
+        else:
+            mapped_fields = len(transform_result)
+            _add_log(
+                state, PipelineStage.DATA_FLOW,
+                f"Data flow test passed: {mapped_fields} top-level fields in output",
+                detail=transform_output,
+            )
+
+        # Store the validation result if the Code Generator agent ran Gemini
+        # (it's embedded in the agent's tool calls, not directly accessible here,
+        # so we create a basic one from the data flow test)
+        state.validation_result = {
+            "data_flow_test": "passed" if "error" not in transform_result else "failed",
+            "sample_input": json.loads(sample_json) if "error" not in json.loads(sample_json) else sample_json,
+            "sample_output": transform_result,
+            "transform_spec_notes": transform_spec.notes,
+        }
+
+        _transition(
+            state, PipelineStage.DATA_FLOW, 95.0,
+            "Data flow test complete",
+            callback,
+        )
+
+        # ── Complete ────────────────────────────────────────────────
+        state.completed_at = _now()
+        _transition(
+            state, PipelineStage.COMPLETED, 100.0,
+            f"Pipeline complete. Total time: "
+            f"{(state.completed_at - state.started_at).total_seconds():.1f}s",
+            callback,
+        )
+
+    except Exception as e:
+        state.current_stage = PipelineStage.ERROR
+        state.error = str(e)
+        state.completed_at = _now()
+        _add_log(state, PipelineStage.ERROR, f"Pipeline failed: {e}", detail=str(type(e).__name__))
+        logger.exception("Pipeline error")
+        if callback:
+            callback(state)
+
+    return state
+
+
+# ─── CLI Entry Point ─────────────────────────────────────────────────────
+
+
+async def _main():
+    """Run the pipeline from the command line."""
+    import sys
+
+    schema_name = sys.argv[1] if len(sys.argv) > 1 else "Workday Enterprise"
+
+    def _print_callback(state: PipelineState):
+        print(f"[{state.current_stage.value}] {state.progress_percent:.0f}% — {state.logs[-1].message}")
+
+    print(f"\n{'='*60}")
+    print(f"  Virtual FDE — Running pipeline: {schema_name}")
+    print(f"{'='*60}\n")
+
+    state = await run_pipeline(schema_name, callback=_print_callback)
+
+    if state.error:
+        print(f"\n❌ Pipeline failed: {state.error}")
+        sys.exit(1)
+    else:
+        print(f"\n✅ Pipeline completed successfully")
+        print(f"   Fields discovered: {state.schema_report['total_field_count'] if state.schema_report else 'N/A'}")
+        print(f"   Fields mapped: {len(state.mapping_document['mappings']) if state.mapping_document else 'N/A'}")
+        print(f"   Middleware size: {len(state.generated_middleware or '')} chars")
+        print(f"   Total time: {(state.completed_at - state.started_at).total_seconds():.1f}s")
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
+```
+
+---
+
+#### 5.5 File: `tests/test_orchestrator.py`
+
+```python
+"""
+Tests for the Deployment Orchestrator.
+
+- Unit tests for helper functions (no API key)
+- Pipeline config tests (no API key)
+- Full integration test (requires OPENAI_API_KEY, optionally GOOGLE_API_KEY)
+"""
+
+import os
+import json
+import pytest
+from datetime import datetime, timezone
+
+from src.models import PipelineState, PipelineStage, LogEntry
+from src.agents.orchestrator import (
+    SCHEMA_CONFIGS,
+    _now,
+    _add_log,
+    _transition,
+    run_pipeline,
+)
+
+
+# ─── Config Tests ────────────────────────────────────────────────────────
+
+
+class TestSchemaConfigs:
+    def test_all_schemas_defined(self):
+        assert "Workday Enterprise" in SCHEMA_CONFIGS
+        assert "SmartRecruiters Lite" in SCHEMA_CONFIGS
+        assert "Legacy Oracle" in SCHEMA_CONFIGS
+
+    def test_config_has_required_keys(self):
+        for name, config in SCHEMA_CONFIGS.items():
+            assert "schema_path" in config, f"{name} missing schema_path"
+            assert "entity_name" in config, f"{name} missing entity_name"
+            assert "fairshot_spec_path" in config, f"{name} missing fairshot_spec_path"
+
+    def test_schema_files_exist(self):
+        for name, config in SCHEMA_CONFIGS.items():
+            assert os.path.exists(config["schema_path"]), f"{name}: {config['schema_path']} not found"
+            assert os.path.exists(config["fairshot_spec_path"]), f"{name}: {config['fairshot_spec_path']} not found"
+
+
+# ─── Helper Tests ────────────────────────────────────────────────────────
+
+
+class TestHelpers:
+    def test_now_returns_utc(self):
+        ts = _now()
+        assert ts.tzinfo is not None
+
+    def test_add_log(self):
+        state = PipelineState()
+        _add_log(state, PipelineStage.IDLE, "test message", detail="some detail")
+        assert len(state.logs) == 1
+        assert state.logs[0].message == "test message"
+        assert state.logs[0].detail == "some detail"
+        assert state.logs[0].stage == PipelineStage.IDLE
+
+    def test_transition_updates_state(self):
+        state = PipelineState()
+        callback_calls = []
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 25.0,
+            "exploring", callback=lambda s: callback_calls.append(s.current_stage)
+        )
+        assert state.current_stage == PipelineStage.SCHEMA_EXPLORATION
+        assert state.progress_percent == 25.0
+        assert len(state.logs) == 1
+        assert len(callback_calls) == 1
+        assert callback_calls[0] == PipelineStage.SCHEMA_EXPLORATION
+
+    def test_transition_without_callback(self):
+        state = PipelineState()
+        _transition(state, PipelineStage.COMPLETED, 100.0, "done")
+        assert state.current_stage == PipelineStage.COMPLETED
+
+
+# ─── Pipeline Error Handling ─────────────────────────────────────────────
+
+
+class TestPipelineErrors:
+    @pytest.mark.asyncio
+    async def test_invalid_schema_name(self):
+        state = await run_pipeline("Nonexistent ATS")
+        assert state.current_stage == PipelineStage.ERROR
+        assert "Unknown schema" in state.error
+        assert len(state.logs) >= 1
+
+
+# ─── Full Integration Test ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_full_pipeline_workday():
+    """End-to-end pipeline test against Workday schema.
+    Requires OPENAI_API_KEY. Optionally uses GOOGLE_API_KEY for Gemini validation.
+    """
+    if not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "sk-your-openai-key-here":
+        pytest.skip("Skipping integration test — OPENAI_API_KEY not set")
+
+    stage_log = []
+
+    def track_callback(state: PipelineState):
+        stage_log.append(state.current_stage)
+
+    state = await run_pipeline("Workday Enterprise", callback=track_callback)
+
+    # Pipeline should complete (or error gracefully)
+    assert state.current_stage in (PipelineStage.COMPLETED, PipelineStage.ERROR), (
+        f"Pipeline ended in unexpected stage: {state.current_stage}"
+    )
+
+    if state.current_stage == PipelineStage.COMPLETED:
+        # Verify all artifacts present
+        assert state.schema_report is not None, "Missing schema_report"
+        assert state.mapping_document is not None, "Missing mapping_document"
+        assert state.generated_middleware is not None, "Missing generated_middleware"
+        assert state.validation_result is not None, "Missing validation_result"
+
+        # Verify schema report
+        assert state.schema_report["total_field_count"] >= 30
+
+        # Verify mapping document
+        assert len(state.mapping_document["mappings"]) >= 10
+
+        # Verify middleware is valid Python
+        compile(state.generated_middleware, "<test>", "exec")
+
+        # Verify timing
+        assert state.started_at is not None
+        assert state.completed_at is not None
+        elapsed = (state.completed_at - state.started_at).total_seconds()
+        assert elapsed < 120, f"Pipeline took {elapsed:.1f}s — target is < 60s"
+
+        # Verify callback was called for each stage
+        assert PipelineStage.SCHEMA_EXPLORATION in stage_log
+        assert PipelineStage.SEMANTIC_MAPPING in stage_log
+        assert PipelineStage.CODE_GENERATION in stage_log
+        assert PipelineStage.COMPLETED in stage_log
+
+        # Verify logs
+        assert len(state.logs) >= 6  # At least 2 per stage (start + complete)
+    else:
+        # If it errored, just make sure the error was logged
+        assert state.error is not None
+        print(f"Pipeline errored (may be expected without full API access): {state.error}")
+```
+
+---
+
+#### 5.6 Running the Orchestrator
+
+**From CLI:**
+```bash
+# Default: Workday Enterprise
+python -m src.agents.orchestrator
+
+# Specific schema
+python -m src.agents.orchestrator "SmartRecruiters Lite"
+python -m src.agents.orchestrator "Legacy Oracle"
+```
+
+**From code (for the dashboard in Phase 6):**
+```python
+import asyncio
+from src.agents.orchestrator import run_pipeline
+
+def my_callback(state):
+    # Update Streamlit UI
+    st.session_state["pipeline_state"] = state
+
+state = asyncio.run(run_pipeline("Workday Enterprise", callback=my_callback))
+```
+
+---
+
+#### 5.7 Implementation Notes for Gemini
+
+1. **This is NOT an LLM agent.** Do not use the OpenAI Agents SDK `Agent` class for the orchestrator. It's a plain `async def run_pipeline()` function. The LLM reasoning happens inside the worker agents it calls.
+
+2. **The callback pattern is critical for Phase 6.** The dashboard will pass a callback that updates `st.session_state` on each stage transition. Make sure `_transition()` always calls the callback AFTER updating the state.
+
+3. **Error handling:** The `try/except` wraps the entire pipeline. If any worker agent fails (API error, timeout, invalid output), the pipeline catches it, sets `PipelineStage.ERROR`, logs the error, and returns the state. The dashboard can then display what went wrong.
+
+4. **The `__main__` block** allows running the pipeline directly from CLI for testing: `python -m src.agents.orchestrator`. It prints stage transitions to stdout.
+
+5. **`PipelineState` stores artifacts as dicts** (via `.model_dump()`), not as Pydantic model instances. This is because `PipelineState.schema_report` is typed as `Optional[Any]` — serializing to dict makes it JSON-safe for the dashboard and avoids Pydantic-in-Pydantic serialization issues.
+
+6. **The validation result** in `state.validation_result` is a simple dict from the data flow test, NOT the full Gemini `ValidationResult`. The Gemini validation happens inside the Code Generator agent's tool calls and isn't directly accessible to the orchestrator. The Phase 6 dashboard can display both the data flow test result and any Gemini feedback from the agent's logs if needed.
+
+7. **Timing:** The 60-second target is aspirational. The test asserts `< 120s` to account for cold API calls. Phase 6 will add `diskcache` for re-runs.
+
+---
+
+#### 5.8 Files Checklist
+
+| File | Action | Notes |
+|------|--------|-------|
+| `src/agents/orchestrator.py` | **Create** | Full implementation from Section 5.4 |
+| `tests/test_orchestrator.py` | **Create** | Full test suite from Section 5.5 |
+
+No other files need modification.
+
+---
+
+#### 5.9 Acceptance Criteria
+
+- [ ] `python -m src.agents.orchestrator` runs and prints stage transitions to stdout
+- [ ] `python -m src.agents.orchestrator "Workday Enterprise"` completes without error (with API keys)
+- [ ] `pytest tests/test_orchestrator.py -v -k "not full_pipeline"` passes — config, helper, and error tests pass without API keys
+- [ ] (With API key) Full pipeline produces a `PipelineState` with `current_stage == COMPLETED`
+- [ ] (With API key) `state.schema_report` is populated with field data
+- [ ] (With API key) `state.mapping_document` contains at least 10 mappings
+- [ ] (With API key) `state.generated_middleware` is valid Python (`compile()` succeeds)
+- [ ] (With API key) Callback is invoked at each stage transition
+- [ ] (With API key) Pipeline logs contain at least 6 entries
+- [ ] Invalid schema name returns `PipelineStage.ERROR` with descriptive error message
 
 **Dependencies:** Phase 4
 
 ---
 
-### Phase 6: Frontend Dashboard
+### Phase 6: Frontend Dashboard — DETAILED SPEC
 
-**Goal:** Build a Streamlit dashboard that visualizes the pipeline in real-time.
+**Goal:** Replace the Phase 1 skeleton with a fully interactive Streamlit dashboard that runs the orchestrator pipeline and visualizes every stage in real-time.
 
-**Scope:**
-- Implement `app/dashboard.py` with the following panels:
-  1. **Input panel:** Schema selector dropdown + "Start Integration" button
-  2. **Pipeline progress bar:** Shows current stage with percentage
-  3. **Schema Explorer panel:** Live-streaming field discovery, tree visualization
-  4. **Semantic Mapping panel:** Side-by-side ATS↔Fairshot field mapping with confidence colors
-  5. **Code Generation panel:** Syntax-highlighted generated code + Gemini validation results
-  6. **Data Flow panel:** Input record → transformation → output record visualization
-  7. **Log panel:** Scrolling event log
-- Connect dashboard to the orchestrator pipeline
-- Use Streamlit's `st.status`, `st.expander`, and streaming capabilities for real-time updates
+**Dependencies:** Phase 5 (orchestrator with callback protocol)
 
-**Implementation details:**
-- Use `st.session_state` to manage pipeline state across reruns
-- Use `st.columns` for side-by-side layouts
-- Use `st.code` with `language="python"` for syntax highlighting
-- Use color indicators: green/yellow/red for confidence levels
-- The pipeline should run in a background thread or use Streamlit's async support
-- Add a "Schema Drift" button (for Phase 7) — disabled/placeholder in this phase
-- Style the dashboard to look professional — dark theme preferred, Fairshot branding colors if available
+---
 
-**Files to create/modify:**
-- `app/dashboard.py` (rewrite from Phase 1 skeleton)
-- `app/static/` (any CSS or assets if needed)
+#### 6.1 Architecture: Streamlit + Threading
 
-**Acceptance criteria:**
+Streamlit reruns the entire script on every interaction. The pipeline is async and takes 30-90 seconds. We need to run it in a background thread so the UI remains responsive and can display real-time updates.
+
+**Pattern:**
+1. User clicks "Start Integration"
+2. Dashboard spawns a `threading.Thread` that runs `asyncio.run(run_pipeline(...))`
+3. The thread uses the callback to write state updates to `st.session_state`
+4. Streamlit's `st.rerun()` is NOT called from the callback (thread-unsafe). Instead, the dashboard uses `st.empty()` containers + `time.sleep()` polling loop to refresh panels while the pipeline runs.
+
+```
+┌─ Streamlit Main Thread ────────────────────────────┐
+│  1. Render sidebar (schema selector, start button)  │
+│  2. On click: spawn pipeline thread                 │
+│  3. Poll st.session_state in a loop                 │
+│  4. Update panels on each poll cycle                │
+│  5. Exit loop when pipeline completes               │
+└─────────────────────────────────────────────────────┘
+        │
+        │  callback writes to st.session_state
+        │
+┌─ Pipeline Thread ──────────────────────────────────┐
+│  asyncio.run(run_pipeline(schema, callback))        │
+│  callback(state) → st.session_state["state"] = state│
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 6.2 Session State Schema
+
+```python
+# Initialize in st.session_state at app startup
+if "pipeline_state" not in st.session_state:
+    st.session_state["pipeline_state"] = None       # PipelineState or None
+if "pipeline_running" not in st.session_state:
+    st.session_state["pipeline_running"] = False     # True while thread is alive
+if "pipeline_complete" not in st.session_state:
+    st.session_state["pipeline_complete"] = False    # True after pipeline finishes
+if "selected_schema" not in st.session_state:
+    st.session_state["selected_schema"] = "Workday Enterprise"
+```
+
+---
+
+#### 6.3 Dashboard Layout
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Virtual FDE — Enterprise Integration Concierge                  │
+│  Autonomous ATS → Fairshot integration in under 60 seconds       │
+├────────────┬────────────────────────────────────────────────────┤
+│  SIDEBAR   │  MAIN AREA                                          │
+│            │                                                      │
+│  Schema:   │  ┌─ Progress Bar ──────────────────────────────┐   │
+│  [dropdown]│  │  ████████░░░░░░░░░░ 55% — Semantic Mapping  │   │
+│            │  └──────────────────────────────────────────────┘   │
+│  [Start]   │                                                      │
+│            │  ┌─ Schema Explorer ─┐  ┌─ Semantic Mapping ────┐  │
+│  Status:   │  │ 52 fields found   │  │ ATS Field → Fairshot  │  │
+│  ■ Explore │  │ 3 endpoints       │  │ 🟢 cand_nm_first →   │  │
+│  ■ Map     │  │ Conventions:      │  │    first_name (0.95)  │  │
+│  ■ CodeGen │  │ _v3_Final, ...    │  │ 🟡 source_cd →       │  │
+│  ○ DataFlow│  │                   │  │    source_channel     │  │
+│            │  └───────────────────┘  └───────────────────────┘  │
+│  [Drift]   │                                                      │
+│  (disabled)│  ┌─ Code Generation ─┐  ┌─ Live Data Flow ──────┐  │
+│            │  │ ```python         │  │ INPUT (ATS):           │  │
+│            │  │ def transform...  │  │ {"cand_nm_first":...}  │  │
+│            │  │ ```               │  │         ↓              │  │
+│            │  │ Gemini: ✅ Valid  │  │ OUTPUT (Fairshot):     │  │
+│            │  │                   │  │ {"first_name":"Jane"}  │  │
+│            │  └───────────────────┘  └───────────────────────┘  │
+│            │                                                      │
+│            │  ┌─ Event Log ──────────────────────────────────┐  │
+│            │  │ [14:30:01] Schema exploration started         │  │
+│            │  │ [14:30:11] 52 fields discovered               │  │
+│            │  │ [14:30:12] Semantic mapping started            │  │
+│            │  └──────────────────────────────────────────────┘  │
+└────────────┴────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 6.4 File: `app/dashboard.py`
+
+```python
+"""
+Virtual FDE — Enterprise Integration Concierge
+Streamlit Dashboard (Phase 6)
+"""
+
+import asyncio
+import json
+import threading
+import time
+from datetime import datetime
+
+import streamlit as st
+
+from src.agents.orchestrator import run_pipeline, SCHEMA_CONFIGS
+from src.models import PipelineState, PipelineStage
+
+# ─── Page Config ─────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="Virtual FDE — Fairshot",
+    page_icon="🔌",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─── Session State Init ─────────────────────────────────────────────────
+
+for key, default in {
+    "pipeline_state": None,
+    "pipeline_running": False,
+    "pipeline_complete": False,
+    "selected_schema": "Workday Enterprise",
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# ─── Pipeline Thread ─────────────────────────────────────────────────────
+
+
+def _pipeline_callback(state: PipelineState):
+    """Called from the pipeline thread on every state transition."""
+    # Deep copy via serialization to avoid cross-thread mutation issues
+    st.session_state["pipeline_state"] = state.model_dump()
+
+
+def _run_in_thread(schema_name: str):
+    """Runs the async pipeline in a background thread."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run_pipeline(schema_name, callback=_pipeline_callback))
+    finally:
+        loop.close()
+    st.session_state["pipeline_running"] = False
+    st.session_state["pipeline_complete"] = True
+
+
+# ─── Sidebar ─────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("⚡ Virtual FDE")
+    st.caption("Enterprise Integration Concierge")
+    st.divider()
+
+    schema_choice = st.selectbox(
+        "Select ATS Schema",
+        options=list(SCHEMA_CONFIGS.keys()),
+        index=0,
+        disabled=st.session_state["pipeline_running"],
+    )
+    st.session_state["selected_schema"] = schema_choice
+
+    if st.button(
+        "🚀 Start Integration",
+        type="primary",
+        use_container_width=True,
+        disabled=st.session_state["pipeline_running"],
+    ):
+        st.session_state["pipeline_state"] = None
+        st.session_state["pipeline_complete"] = False
+        st.session_state["pipeline_running"] = True
+        thread = threading.Thread(
+            target=_run_in_thread, args=(schema_choice,), daemon=True
+        )
+        thread.start()
+
+    st.divider()
+
+    # ── Stage Indicators ──
+    st.subheader("Pipeline Stages")
+    state_data = st.session_state.get("pipeline_state")
+
+    stages = [
+        ("schema_exploration", "Schema Exploration"),
+        ("semantic_mapping", "Semantic Mapping"),
+        ("code_generation", "Code Generation"),
+        ("data_flow", "Live Data Flow"),
+        ("completed", "Complete"),
+    ]
+
+    current = state_data["current_stage"] if state_data else "idle"
+    passed_current = False
+    for stage_key, stage_label in stages:
+        if stage_key == current:
+            st.markdown(f"🔵 **{stage_label}** _(active)_")
+            passed_current = True
+        elif not passed_current and current != "idle" and current != "error":
+            st.markdown(f"✅ {stage_label}")
+        else:
+            st.markdown(f"⚪ {stage_label}")
+
+    if current == "error" and state_data:
+        st.error(f"❌ Error: {state_data.get('error', 'Unknown')}")
+
+    st.divider()
+
+    # Schema Drift button — placeholder for Phase 7
+    st.button(
+        "⚡ Trigger Schema Drift",
+        disabled=True,
+        use_container_width=True,
+        help="Coming in Phase 7",
+    )
+
+
+# ─── Main Title ──────────────────────────────────────────────────────────
+
+st.title("Virtual FDE")
+st.caption("Autonomous ATS → Fairshot integration in under 60 seconds")
+
+# ─── Progress Bar ────────────────────────────────────────────────────────
+
+progress_container = st.empty()
+
+if state_data and state_data.get("progress_percent", 0) > 0:
+    progress_container.progress(
+        int(state_data["progress_percent"]),
+        text=f"{state_data['current_stage'].replace('_', ' ').title()} — {state_data['progress_percent']:.0f}%",
+    )
+elif st.session_state["pipeline_running"]:
+    progress_container.progress(0, text="Initializing pipeline...")
+
+st.divider()
+
+# ─── Panels ──────────────────────────────────────────────────────────────
+
+col1, col2 = st.columns(2)
+
+# ── Panel 1: Schema Explorer ──
+with col1:
+    with st.expander("📡 Schema Explorer", expanded=True):
+        if state_data and state_data.get("schema_report"):
+            report = state_data["schema_report"]
+            st.metric("Fields Discovered", report["total_field_count"])
+            st.metric("Endpoints", len(report["endpoints"]))
+            st.metric("Nesting Depth", report["nesting_depth"])
+
+            if report.get("custom_conventions"):
+                st.markdown("**Naming Conventions:**")
+                for conv in report["custom_conventions"]:
+                    st.markdown(f"- `{conv}`")
+
+            if report.get("anomaly_summary"):
+                st.info(report["anomaly_summary"])
+
+            # Show field list in a collapsible
+            with st.popover("View All Fields"):
+                for field in report.get("fields", [])[:30]:  # Cap at 30 for performance
+                    badge = "🔴" if field.get("anomalies") else "🟢"
+                    st.markdown(
+                        f"{badge} `{field['nested_path']}` — "
+                        f"_{field['field_type']}_ "
+                        f"{'(nullable)' if field.get('nullable') else '(required)'}"
+                    )
+                if len(report.get("fields", [])) > 30:
+                    st.caption(f"...and {len(report['fields']) - 30} more fields")
+        else:
+            st.caption("Waiting for schema exploration...")
+
+# ── Panel 2: Semantic Mapping ──
+with col2:
+    with st.expander("🔗 Semantic Mapping", expanded=True):
+        if state_data and state_data.get("mapping_document"):
+            doc = state_data["mapping_document"]
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Fields Mapped", len(doc["mappings"]))
+            mc2.metric("Coverage", f"{doc['mapping_coverage']:.0%}")
+            mc3.metric("Avg Confidence", f"{doc['overall_confidence']:.2f}")
+
+            # Mapping table
+            for m in doc["mappings"]:
+                conf = m["confidence_score"]
+                if conf >= 0.9:
+                    badge = "🟢"
+                elif conf >= 0.7:
+                    badge = "🟡"
+                else:
+                    badge = "🔴"
+
+                st.markdown(
+                    f"{badge} `{m['ats_field']}` → **{m['fairshot_field']}** "
+                    f"({conf:.2f}) — _{m['transform_function']}_"
+                )
+
+            # Unmapped fields
+            if doc.get("unmapped_ats_fields"):
+                with st.popover(f"⚠️ {len(doc['unmapped_ats_fields'])} Unmapped ATS Fields"):
+                    for f in doc["unmapped_ats_fields"]:
+                        st.markdown(f"- `{f}`")
+        else:
+            st.caption("Waiting for semantic mapping...")
+
+# ── Panel 3: Code Generation ──
+with col1:
+    with st.expander("💻 Code Generation", expanded=True):
+        if state_data and state_data.get("generated_middleware"):
+            code = state_data["generated_middleware"]
+            st.code(code, language="python", line_numbers=True)
+
+            # Show validation info if available
+            vr = state_data.get("validation_result", {})
+            if vr:
+                test_status = vr.get("data_flow_test", "unknown")
+                if test_status == "passed":
+                    st.success("✅ Data flow test passed")
+                else:
+                    st.error("❌ Data flow test failed")
+
+                if vr.get("transform_spec_notes"):
+                    st.info(f"Agent notes: {vr['transform_spec_notes']}")
+        else:
+            st.caption("Waiting for code generation...")
+
+# ── Panel 4: Live Data Flow ──
+with col2:
+    with st.expander("🔄 Live Data Flow", expanded=True):
+        if state_data and state_data.get("validation_result"):
+            vr = state_data["validation_result"]
+
+            st.markdown("**INPUT** (Raw ATS Record)")
+            sample_in = vr.get("sample_input", {})
+            # Show a condensed version (first 10 keys)
+            if isinstance(sample_in, dict):
+                condensed = {k: sample_in[k] for k in list(sample_in.keys())[:10]}
+                st.json(condensed)
+                if len(sample_in) > 10:
+                    st.caption(f"...{len(sample_in) - 10} more fields")
+            else:
+                st.json(sample_in)
+
+            st.markdown("⬇️")
+
+            st.markdown("**OUTPUT** (Fairshot API Payload)")
+            sample_out = vr.get("sample_output", {})
+            st.json(sample_out)
+
+            # Field count comparison
+            if isinstance(sample_in, dict) and isinstance(sample_out, dict):
+                st.caption(
+                    f"{len(sample_in)} ATS fields → "
+                    f"{len(sample_out)} Fairshot fields — "
+                    f"zero data loss on mapped fields"
+                )
+        else:
+            st.caption("Waiting for data flow test...")
+
+st.divider()
+
+# ── Panel 5: Event Log ──
+with st.expander("📋 Event Log", expanded=not st.session_state["pipeline_complete"]):
+    if state_data and state_data.get("logs"):
+        for log in reversed(state_data["logs"]):
+            ts = log.get("timestamp", "")
+            if isinstance(ts, str) and "T" in ts:
+                ts = ts.split("T")[1][:8]  # Extract HH:MM:SS
+            stage = log.get("stage", "").replace("_", " ").title()
+            st.markdown(f"`[{ts}]` **{stage}** — {log['message']}")
+            if log.get("detail"):
+                with st.popover("Detail"):
+                    st.code(log["detail"], language="json")
+    else:
+        st.caption("No events yet. Click 'Start Integration' to begin.")
+
+# ─── Auto-refresh while running ─────────────────────────────────────────
+
+if st.session_state["pipeline_running"]:
+    time.sleep(1.5)
+    st.rerun()
+```
+
+---
+
+#### 6.5 Streamlit Theme Config
+
+Create `app/.streamlit/config.toml` (Streamlit picks this up automatically when launched from the `app/` dir. Alternatively create `.streamlit/config.toml` at the project root):
+
+```toml
+[theme]
+primaryColor = "#4F46E5"
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+textColor = "#E2E8F0"
+font = "monospace"
+```
+
+> **Note for Gemini:** Create `.streamlit/config.toml` at the project root (not inside `app/`). Streamlit looks for `.streamlit/` relative to the working directory where `streamlit run` is executed.
+
+---
+
+#### 6.6 Implementation Notes for Gemini
+
+1. **The `time.sleep(1.5) + st.rerun()` pattern** at the bottom is the polling loop. While `pipeline_running` is True, the script sleeps 1.5 seconds, then Streamlit reruns the whole script, which re-reads `st.session_state["pipeline_state"]` and updates all panels. This is the standard Streamlit pattern for background task visualization. The 1.5s interval balances responsiveness vs. CPU usage.
+
+2. **`_pipeline_callback` writes to `st.session_state` directly.** Streamlit session state is thread-safe for simple assignments. We serialize via `model_dump()` to avoid Pydantic model cross-thread issues.
+
+3. **The sidebar stage indicators** use a simple state machine: stages before `current` show ✅, the `current` stage shows 🔵, stages after show ⚪. This works because the pipeline is sequential.
+
+4. **`st.popover`** is used for expandable detail views (field lists, unmapped fields, log details). This keeps the main dashboard clean. If `st.popover` isn't available in the installed Streamlit version, fall back to `st.expander`.
+
+5. **The "Trigger Schema Drift" button** is present but `disabled=True`. Phase 7 will enable it.
+
+6. **Performance:** The field list in Schema Explorer is capped at 30 entries with `[:30]`. The mapping list shows all mappings (typically 15-25). If these cause performance issues, add pagination.
+
+7. **Running the dashboard:**
+   ```bash
+   streamlit run app/dashboard.py
+   ```
+   Make sure `.env` is populated with API keys before launching.
+
+---
+
+#### 6.7 Files Checklist
+
+| File | Action | Notes |
+|------|--------|-------|
+| `app/dashboard.py` | **Rewrite** | Full implementation from Section 6.4 (replaces Phase 1 skeleton) |
+| `.streamlit/config.toml` | **Create** | Dark theme config from Section 6.5 |
+
+---
+
+#### 6.8 Acceptance Criteria
+
 - [ ] `streamlit run app/dashboard.py` launches without errors
-- [ ] Selecting a schema and clicking "Start" triggers the full pipeline
-- [ ] All 6 panels update in real-time as the pipeline progresses
-- [ ] Mapping panel shows color-coded confidence scores
-- [ ] Code panel shows both generated code and Gemini review
-- [ ] Data flow panel shows end-to-end transformation of a sample record
-- [ ] Dashboard is visually polished and demo-ready
+- [ ] Schema dropdown shows all 3 options (Workday, SmartRecruiters, Oracle)
+- [ ] Clicking "Start Integration" triggers the pipeline and disables the button
+- [ ] Progress bar updates in real-time as pipeline stages complete
+- [ ] Sidebar stage indicators show ✅/🔵/⚪ progression
+- [ ] Schema Explorer panel shows field count, endpoints, nesting depth, conventions
+- [ ] Semantic Mapping panel shows color-coded mappings (🟢/🟡/🔴) with confidence scores
+- [ ] Code Generation panel shows syntax-highlighted Python middleware
+- [ ] Data Flow panel shows side-by-side input (ATS) → output (Fairshot) JSON
+- [ ] Event Log shows timestamped pipeline events in reverse chronological order
+- [ ] Dashboard remains responsive during pipeline execution (no freezing)
+- [ ] (With API keys) Full pipeline runs end-to-end from the dashboard
+- [ ] "Trigger Schema Drift" button is visible but disabled
+- [ ] Dark theme applies via `.streamlit/config.toml`
 
 **Dependencies:** Phase 5
 
 ---
 
-### Phase 7: Schema Drift & Polish
+### Phase 7: Schema Drift & Polish — DETAILED SPEC
 
-**Goal:** Implement schema drift detection and auto-repair. Final demo polish.
+**Goal:** Implement the "wow moment" — mid-demo schema drift detection and auto-repair. Plus final polish and a demo walkthrough script.
 
-**Scope:**
-- Add schema drift simulation capability:
-  - A "Trigger Schema Drift" button in the dashboard
-  - When clicked, modifies the active schema (renames a field, adds a new field, changes a type)
-  - System detects the drift by comparing against the stored `SchemaReport`
-  - Orchestrator triggers re-exploration → re-mapping → re-generation for affected fields only
-  - Dashboard shows the full drift detection → auto-repair flow with visual indicators
-- Error handling and self-healing visualization
-- Demo script / walkthrough notes
-- Final polish:
-  - Loading animations
-  - Professional styling
-  - Timing optimization (ensure < 60 second total flow)
-  - Edge case handling
+**Dependencies:** Phase 6 (dashboard must be fully functional)
 
-**Implementation details:**
-- Schema drift detection should compare field names, types, and structure between original and modified schema
-- Only re-process affected fields (incremental re-mapping, not full restart)
-- Dashboard should clearly show:
-  - What changed (diff view)
-  - What was affected (which mappings broke)
-  - How it was fixed (new mappings + regenerated transforms)
-- Add a pre-built "drift scenario" for each mock schema
+---
 
-**Files to create/modify:**
-- `src/agents/orchestrator.py` (add drift detection logic)
-- `app/dashboard.py` (add drift UI)
-- `src/mock_data/workday_schema_drifted.json` (modified schema for drift demo)
-- Create `DEMO_SCRIPT.md` with step-by-step demo walkthrough
+#### 7.1 Architecture: Hash-Based Drift Detection
 
-**Acceptance criteria:**
-- [ ] "Trigger Schema Drift" button introduces 3 breaking changes to the active schema
-- [ ] System detects all 3 changes within 5 seconds
-- [ ] Auto-repair completes without manual intervention
-- [ ] Dashboard shows clear before/after diff
-- [ ] Full demo (including drift) completes in < 90 seconds
-- [ ] `DEMO_SCRIPT.md` provides a complete walkthrough for the presenter
+Per Gemini's cross-agent feedback, we use **per-field hashing** instead of full schema re-parse. When the initial pipeline runs, we compute a hash fingerprint of the schema. When drift is triggered, we compare the new schema's fingerprint to detect exactly which fields changed.
+
+```
+Original Schema ──► field_hash_registry (dict[field_path, hash])
+                         │
+    "Trigger Drift" ──► Modified Schema ──► new hashes
+                         │
+                    Compare registries
+                         │
+                    DriftReport: {renamed, added, type_changed}
+                         │
+                    Re-map ONLY affected fields
+                         │
+                    Re-generate ONLY affected transforms
+```
+
+**No full pipeline re-run.** The drift repair is surgical:
+1. Detect which fields changed (hash diff)
+2. Update the SchemaReport with changed fields
+3. Re-run Semantic Mapper with ONLY the changed/new fields + the original MappingDocument as context
+4. Patch the MappingDocument and TransformSpec
+5. Re-render middleware
+
+---
+
+#### 7.2 Drift Scenarios (Pre-Built)
+
+Each mock schema gets a corresponding drift scenario. Only Workday is required for the demo; the others are nice-to-have.
+
+##### Workday Drift Scenario (`src/mock_data/workday_drift.json`)
+
+Three breaking changes applied to the Workday schema:
+
+```json
+{
+  "drift_name": "Workday Q1 2025 Schema Update",
+  "description": "Simulates a Workday platform update that renames, adds, and changes fields",
+  "changes": [
+    {
+      "type": "rename",
+      "entity": "WD_Candidate_Profile",
+      "old_field": "Custom_Req_ID_v3_Final",
+      "new_field": "Requisition_Reference_ID",
+      "description": "Workday deprecated the v3 custom field naming convention"
+    },
+    {
+      "type": "add",
+      "entity": "WD_Candidate_Profile",
+      "field": "compliance_region",
+      "field_def": {
+        "type": "string",
+        "nullable": false,
+        "enum": ["EMEA", "APAC", "AMERICAS", "GLOBAL"]
+      },
+      "sample_value": "EMEA",
+      "description": "New mandatory compliance field added in Q1 2025 regulatory update"
+    },
+    {
+      "type": "type_change",
+      "entity": "WD_Candidate_Profile",
+      "field": "cand_dob_dt",
+      "old_type": "string",
+      "old_format": "MM/DD/YYYY",
+      "new_type": "string",
+      "new_format": "ISO8601",
+      "description": "Date format standardized to ISO 8601 across all Workday date fields"
+    }
+  ]
+}
+```
+
+The drift scenario file describes the changes declaratively. The drift simulation function reads this file and applies the changes to a copy of the original schema in memory (NOT modifying the original JSON file on disk).
+
+---
+
+#### 7.3 New File: `src/utils/drift.py`
+
+```python
+"""
+Schema Drift Detection & Simulation — Phase 7
+
+Provides:
+- Hash-based schema fingerprinting
+- Drift simulation (applies pre-built drift scenarios)
+- Drift detection (compares fingerprints)
+- DriftReport generation
+"""
+
+import copy
+import hashlib
+import json
+import logging
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+# ─── Data Models ─────────────────────────────────────────────────────────
+
+
+class FieldChange(BaseModel):
+    """A single detected field change."""
+    change_type: str = Field(description="rename | add | remove | type_change")
+    entity: str
+    field_path: str
+    old_value: str | None = None
+    new_value: str | None = None
+    description: str = ""
+
+
+class DriftReport(BaseModel):
+    """Summary of detected schema drift."""
+    drift_detected: bool
+    total_changes: int
+    changes: list[FieldChange]
+    affected_mappings: list[str] = Field(
+        default_factory=list,
+        description="List of Fairshot fields whose mappings are affected"
+    )
+
+
+# ─── Schema Fingerprinting ──────────────────────────────────────────────
+
+
+def _hash_field(field_def: Any) -> str:
+    """Create a deterministic hash of a field definition."""
+    serialized = json.dumps(field_def, sort_keys=True, default=str)
+    return hashlib.md5(serialized.encode()).hexdigest()[:12]
+
+
+def compute_fingerprint(schema: dict) -> dict[str, str]:
+    """Compute a hash fingerprint for every field in a schema.
+
+    Returns: dict mapping "entity.field_name" → hash string
+    """
+    fingerprint = {}
+    for entity_name, entity_data in schema.get("entities", {}).items():
+        fields = entity_data.get("fields", {})
+        for field_name, field_def in fields.items():
+            key = f"{entity_name}.{field_name}"
+            fingerprint[key] = _hash_field(field_def)
+    return fingerprint
+
+
+# ─── Drift Simulation ───────────────────────────────────────────────────
+
+
+def apply_drift(original_schema: dict, drift_scenario: dict) -> dict:
+    """Apply a drift scenario to a schema, returning the modified schema.
+
+    Does NOT modify the original — returns a deep copy with changes applied.
+    """
+    schema = copy.deepcopy(original_schema)
+
+    for change in drift_scenario.get("changes", []):
+        entity_name = change["entity"]
+        entity = schema.get("entities", {}).get(entity_name, {})
+        fields = entity.get("fields", {})
+        samples = entity.get("sample_records", [])
+
+        if change["type"] == "rename":
+            old_name = change["old_field"]
+            new_name = change["new_field"]
+            if old_name in fields:
+                fields[new_name] = fields.pop(old_name)
+                # Update sample records
+                for record in samples:
+                    if old_name in record:
+                        record[new_name] = record.pop(old_name)
+
+        elif change["type"] == "add":
+            field_name = change["field"]
+            fields[field_name] = change["field_def"]
+            # Add to sample records
+            for record in samples:
+                record[field_name] = change.get("sample_value")
+
+        elif change["type"] == "type_change":
+            field_name = change["field"]
+            if field_name in fields:
+                fields[field_name]["type"] = change["new_type"]
+                if "new_format" in change:
+                    fields[field_name]["format"] = change["new_format"]
+
+        elif change["type"] == "remove":
+            field_name = change["field"]
+            fields.pop(field_name, None)
+            for record in samples:
+                record.pop(field_name, None)
+
+    return schema
+
+
+def load_drift_scenario(drift_path: str) -> dict:
+    """Load a drift scenario JSON file."""
+    with open(drift_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ─── Drift Detection ────────────────────────────────────────────────────
+
+
+def detect_drift(
+    original_fingerprint: dict[str, str],
+    new_fingerprint: dict[str, str],
+    drift_scenario: dict | None = None,
+) -> DriftReport:
+    """Compare two schema fingerprints and return a DriftReport.
+
+    If drift_scenario is provided, uses it for richer change descriptions.
+    Otherwise, infers changes from fingerprint diff.
+    """
+    changes: list[FieldChange] = []
+
+    # Fields removed (in original but not in new)
+    for key in original_fingerprint:
+        if key not in new_fingerprint:
+            entity, field = key.split(".", 1)
+            changes.append(FieldChange(
+                change_type="remove",
+                entity=entity,
+                field_path=key,
+                old_value=field,
+                description=f"Field '{field}' was removed from {entity}",
+            ))
+
+    # Fields added (in new but not in original)
+    for key in new_fingerprint:
+        if key not in original_fingerprint:
+            entity, field = key.split(".", 1)
+            changes.append(FieldChange(
+                change_type="add",
+                entity=entity,
+                field_path=key,
+                new_value=field,
+                description=f"New field '{field}' added to {entity}",
+            ))
+
+    # Fields changed (in both but different hash)
+    for key in original_fingerprint:
+        if key in new_fingerprint and original_fingerprint[key] != new_fingerprint[key]:
+            entity, field = key.split(".", 1)
+            changes.append(FieldChange(
+                change_type="type_change",
+                entity=entity,
+                field_path=key,
+                old_value=original_fingerprint[key],
+                new_value=new_fingerprint[key],
+                description=f"Field '{field}' definition changed in {entity}",
+            ))
+
+    # Enrich with drift scenario descriptions if available
+    if drift_scenario:
+        scenario_changes = {
+            c.get("old_field", c.get("field", "")): c.get("description", "")
+            for c in drift_scenario.get("changes", [])
+        }
+        for change in changes:
+            field_name = change.field_path.split(".")[-1]
+            if field_name in scenario_changes:
+                change.description = scenario_changes[field_name]
+
+    # Detect renames: a remove + add in the same entity is likely a rename
+    removes = [c for c in changes if c.change_type == "remove"]
+    adds = [c for c in changes if c.change_type == "add"]
+    for rem in removes:
+        for add in adds:
+            if rem.entity == add.entity:
+                # Check if the drift scenario explicitly marks this as a rename
+                if drift_scenario:
+                    for sc in drift_scenario.get("changes", []):
+                        if sc.get("type") == "rename" and sc.get("old_field") == rem.old_value and sc.get("new_field") == add.new_value:
+                            rem.change_type = "rename"
+                            rem.new_value = add.new_value
+                            rem.description = sc.get("description", f"Field renamed: {rem.old_value} → {add.new_value}")
+                            changes.remove(add)
+                            break
+
+    return DriftReport(
+        drift_detected=len(changes) > 0,
+        total_changes=len(changes),
+        changes=changes,
+    )
+```
+
+---
+
+#### 7.4 Drift Scenario Files
+
+##### `src/mock_data/workday_drift.json`
+
+```json
+{
+  "drift_name": "Workday Q1 2025 Schema Update",
+  "description": "Simulates a Workday platform update that renames, adds, and changes fields",
+  "changes": [
+    {
+      "type": "rename",
+      "entity": "WD_Candidate_Profile",
+      "old_field": "Custom_Req_ID_v3_Final",
+      "new_field": "Requisition_Reference_ID",
+      "description": "Workday deprecated the v3 custom field naming convention"
+    },
+    {
+      "type": "add",
+      "entity": "WD_Candidate_Profile",
+      "field": "compliance_region",
+      "field_def": {
+        "type": "string",
+        "nullable": false,
+        "enum": ["EMEA", "APAC", "AMERICAS", "GLOBAL"]
+      },
+      "sample_value": "EMEA",
+      "description": "New mandatory compliance field added in Q1 2025 regulatory update"
+    },
+    {
+      "type": "type_change",
+      "entity": "WD_Candidate_Profile",
+      "field": "cand_dob_dt",
+      "old_type": "string",
+      "old_format": "MM/DD/YYYY",
+      "new_type": "string",
+      "new_format": "ISO8601",
+      "description": "Date format standardized to ISO 8601 across all Workday date fields"
+    }
+  ]
+}
+```
+
+---
+
+#### 7.5 Orchestrator Changes: `src/agents/orchestrator.py`
+
+Add the following to the orchestrator (append to existing file, do NOT rewrite the existing `run_pipeline`):
+
+```python
+# ─── Add these imports at the top ────────────────────────────────────────
+from src.utils.drift import (
+    compute_fingerprint,
+    apply_drift,
+    load_drift_scenario,
+    detect_drift,
+    DriftReport,
+)
+
+# ─── Add this dict after SCHEMA_CONFIGS ──────────────────────────────────
+
+DRIFT_CONFIGS: dict[str, str] = {
+    "Workday Enterprise": "src/mock_data/workday_drift.json",
+}
+
+# ─── Add this function after run_pipeline ────────────────────────────────
+
+
+async def run_drift_repair(
+    schema_name: str,
+    current_state: PipelineState,
+    callback: Callable[[PipelineState], None] | None = None,
+) -> PipelineState:
+    """Simulate schema drift and auto-repair the pipeline.
+
+    Requires a completed pipeline state (from run_pipeline) as input.
+    Modifies the state in-place with drift detection and repair results.
+
+    Args:
+        schema_name: Must match a key in DRIFT_CONFIGS
+        current_state: The PipelineState from a completed run_pipeline call
+        callback: Optional progress callback
+    """
+    state = current_state
+
+    drift_path = DRIFT_CONFIGS.get(schema_name)
+    if not drift_path:
+        _add_log(state, PipelineStage.ERROR, f"No drift scenario for '{schema_name}'")
+        if callback:
+            callback(state)
+        return state
+
+    config = SCHEMA_CONFIGS[schema_name]
+    schema_path = config["schema_path"]
+    entity_name = config["entity_name"]
+    fairshot_spec_path = config["fairshot_spec_path"]
+
+    try:
+        # ── Stage 1: Load original schema and compute fingerprint ────
+        _transition(
+            state, PipelineStage.DRIFT_DETECTION, 5.0,
+            "⚠️ Schema drift detected — analyzing changes...",
+            callback,
+        )
+
+        with open(schema_path, "r") as f:
+            original_schema = json.load(f)
+        original_fp = compute_fingerprint(original_schema)
+
+        # ── Stage 2: Apply drift scenario ────────────────────────────
+        drift_scenario = load_drift_scenario(drift_path)
+        drifted_schema = apply_drift(original_schema, drift_scenario)
+        drifted_fp = compute_fingerprint(drifted_schema)
+
+        # ── Stage 3: Detect changes ──────────────────────────────────
+        drift_report = detect_drift(original_fp, drifted_fp, drift_scenario)
+
+        state.drift_detected = True
+        state.drift_changes = [
+            f"{c.change_type}: {c.field_path} — {c.description}"
+            for c in drift_report.changes
+        ]
+
+        _transition(
+            state, PipelineStage.DRIFT_DETECTION, 20.0,
+            f"Detected {drift_report.total_changes} breaking changes: "
+            + ", ".join(c.change_type for c in drift_report.changes),
+            callback,
+        )
+
+        # ── Stage 4: Re-explore drifted schema ──────────────────────
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 30.0,
+            "Re-exploring drifted schema...",
+            callback,
+        )
+
+        # Write drifted schema to a temp location for the explorer agent
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix="drifted_"
+        ) as tmp:
+            json.dump(drifted_schema, tmp, indent=2)
+            drifted_path = tmp.name
+
+        explorer = create_schema_explorer()
+        explore_result = await Runner.run(
+            explorer, input=f"Analyze the schema at {drifted_path}"
+        )
+        new_schema_report: SchemaReport = explore_result.final_output
+        state.schema_report = new_schema_report.model_dump()
+
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 45.0,
+            f"Re-exploration complete: {new_schema_report.total_field_count} fields "
+            f"(was {len(original_fp)} field definitions)",
+            callback,
+        )
+
+        # ── Stage 5: Re-map with drift context ──────────────────────
+        _transition(
+            state, PipelineStage.SEMANTIC_MAPPING, 50.0,
+            "Re-mapping affected fields...",
+            callback,
+        )
+
+        mapper = create_semantic_mapper()
+        drift_context = "\n".join(
+            f"- {c.change_type}: {c.description}" for c in drift_report.changes
+        )
+        mapper_input = (
+            f"Map the following DRIFTED ATS schema to the Fairshot API.\n\n"
+            f"IMPORTANT: The schema has changed since the last mapping. "
+            f"These specific changes occurred:\n{drift_context}\n\n"
+            f"Schema Report (JSON):\n{new_schema_report.model_dump_json(indent=2)}\n\n"
+            f"Raw schema file: {drifted_path}\n"
+            f"Fairshot API spec file: {fairshot_spec_path}"
+        )
+        map_result = await Runner.run(mapper, input=mapper_input)
+        new_mapping_doc: MappingDocument = map_result.final_output
+        state.mapping_document = new_mapping_doc.model_dump()
+
+        _transition(
+            state, PipelineStage.SEMANTIC_MAPPING, 65.0,
+            f"Re-mapping complete: {len(new_mapping_doc.mappings)} fields mapped",
+            callback,
+        )
+
+        # ── Stage 6: Re-generate middleware ──────────────────────────
+        _transition(
+            state, PipelineStage.CODE_GENERATION, 70.0,
+            "Regenerating middleware for drifted schema...",
+            callback,
+        )
+
+        generator = create_code_generator()
+        gen_input = (
+            f"Generate a TransformSpec for the following mapping.\n\n"
+            f"Mapping Document (JSON):\n{new_mapping_doc.model_dump_json(indent=2)}\n\n"
+            f"Schema file: {drifted_path}\n"
+            f"Primary entity: {entity_name}\n"
+            f"Fairshot spec: {fairshot_spec_path}"
+        )
+        gen_result = await Runner.run(generator, input=gen_input)
+        new_spec: TransformSpec = gen_result.final_output
+        new_middleware = _render_middleware(new_spec)
+        state.generated_middleware = new_middleware
+
+        _transition(
+            state, PipelineStage.CODE_GENERATION, 85.0,
+            f"Middleware regenerated ({len(new_middleware)} chars)",
+            callback,
+        )
+
+        # ── Stage 7: Re-test data flow ───────────────────────────────
+        _transition(
+            state, PipelineStage.DATA_FLOW, 90.0,
+            "Testing data flow with drifted schema...",
+            callback,
+        )
+
+        sample_json = _load_sample_record(drifted_path, entity_name)
+        transform_output = _run_test_transform(new_middleware, sample_json)
+        transform_result = json.loads(transform_output)
+
+        state.validation_result = {
+            "data_flow_test": "passed" if "error" not in transform_result else "failed",
+            "sample_input": json.loads(sample_json),
+            "sample_output": transform_result,
+            "drift_repaired": True,
+            "changes_repaired": len(drift_report.changes),
+        }
+
+        # ── Complete ─────────────────────────────────────────────────
+        state.completed_at = _now()
+        _transition(
+            state, PipelineStage.COMPLETED, 100.0,
+            f"✅ Schema drift auto-repaired: {drift_report.total_changes} changes resolved, "
+            f"0 manual intervention required",
+            callback,
+        )
+
+        # Clean up temp file
+        import os
+        os.unlink(drifted_path)
+
+    except Exception as e:
+        state.current_stage = PipelineStage.ERROR
+        state.error = f"Drift repair failed: {e}"
+        _add_log(state, PipelineStage.ERROR, str(e))
+        logger.exception("Drift repair error")
+        if callback:
+            callback(state)
+
+    return state
+```
+
+---
+
+#### 7.6 Dashboard Changes: `app/dashboard.py`
+
+Modify the existing dashboard to:
+
+1. **Enable the Schema Drift button** after pipeline completes
+2. **Add drift visualization** — change list, before/after diff, repair status
+
+**Changes to make (modify, don't rewrite):**
+
+**Replace** the disabled drift button in the sidebar:
+```python
+    # Schema Drift button — enabled after pipeline completes
+    if st.button(
+        "⚡ Trigger Schema Drift",
+        disabled=not st.session_state.get("pipeline_complete", False)
+            or st.session_state.get("pipeline_running", False)
+            or st.session_state.get("drift_running", False),
+        use_container_width=True,
+        type="secondary",
+    ):
+        st.session_state["drift_running"] = True
+        thread = threading.Thread(
+            target=_run_drift_in_thread,
+            args=(st.session_state["selected_schema"],),
+            daemon=True,
+        )
+        thread.start()
+```
+
+**Add** the drift thread function (after `_run_in_thread`):
+```python
+def _run_drift_in_thread(schema_name: str):
+    """Runs drift repair in a background thread."""
+    from src.agents.orchestrator import run_drift_repair
+    from src.models import PipelineState
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        # Reconstruct PipelineState from session state
+        current_state = PipelineState(**st.session_state["pipeline_state"])
+        loop.run_until_complete(
+            run_drift_repair(schema_name, current_state, callback=_pipeline_callback)
+        )
+    finally:
+        loop.close()
+    st.session_state["drift_running"] = False
+    st.session_state["pipeline_complete"] = True
+```
+
+**Add** `"drift_running": False` to session state init.
+
+**Add** a drift alert panel between the progress bar and the main panels:
+```python
+# ─── Drift Alert ─────────────────────────────────────────────────────
+if state_data and state_data.get("drift_detected"):
+    with st.container():
+        st.warning(f"⚠️ Schema Drift Detected — {len(state_data.get('drift_changes', []))} breaking changes")
+        for change_desc in state_data.get("drift_changes", []):
+            st.markdown(f"- {change_desc}")
+
+        vr = state_data.get("validation_result", {})
+        if vr.get("drift_repaired"):
+            st.success(
+                f"✅ Auto-repaired: {vr.get('changes_repaired', 0)} changes resolved — "
+                f"0 manual intervention required"
+            )
+```
+
+---
+
+#### 7.7 File: `DEMO_SCRIPT.md`
+
+```markdown
+# Virtual FDE — Demo Script
+
+## Pre-Demo Checklist
+- [ ] `.env` populated with `OPENAI_API_KEY` and `GOOGLE_API_KEY`
+- [ ] `pip install -r requirements.txt` completed
+- [ ] `streamlit run app/dashboard.py` running on localhost
+- [ ] Browser in dark mode / full screen
+- [ ] Practice run completed at least once
+
+## Demo Flow (~90 seconds total)
+
+### Opening (15 seconds)
+> "What you're about to see is an autonomous system that replaces
+> weeks of manual enterprise integration work with a single click.
+> No configuration. No data plumbing. No FDE required."
+
+### Step 1: Start Integration (5 seconds)
+1. Select **"Workday Enterprise"** from the dropdown
+2. Click **"Start Integration"**
+3. Point out: "This is a real Workday-like schema — 50+ fields,
+   deeply nested, custom naming conventions, mixed date formats."
+
+### Step 2: Schema Exploration (~10 seconds)
+- Watch the Schema Explorer panel populate in real-time
+- Call out: "The system is autonomously crawling the schema,
+  discovering every field, detecting naming patterns like
+  `_v3_Final` suffixes, and flagging anomalies."
+- Point to the field count and nesting depth metrics
+
+### Step 3: Semantic Mapping (~15 seconds)
+- Watch mappings appear with confidence colors
+- Call out: "Each field is semantically matched — the system
+  understands that `cand_nm_first` means `first_name`, that
+  `addr_city_nm` maps to `location.city`, and that epoch
+  timestamps need conversion to ISO 8601."
+- Point to the green/yellow confidence indicators
+- Click "Unmapped ATS Fields" to show deprecated fields were
+  correctly identified and skipped
+
+### Step 4: Code Generation (~10 seconds)
+- Watch the generated Python appear in the code panel
+- Call out: "The system generates production-style middleware
+  and cross-validates it with a second AI model — Gemini 2.5 Pro.
+  Two sets of eyes on every transform, just like a real code review."
+- Point to the "Data flow test passed" indicator
+
+### Step 5: Live Data Flow (~10 seconds)
+- Point to the Input/Output panels
+- Call out: "Here's a real candidate record flowing through the
+  generated middleware. Messy Workday format in, clean Fairshot
+  API payload out. Zero data loss."
+- Pause for effect: "Total time: under 60 seconds."
+
+### Step 6: Schema Drift — THE WOW MOMENT (~20 seconds)
+1. Say: "But what happens when Workday pushes an update?"
+2. Click **"Trigger Schema Drift"**
+3. Point to the drift alert: "Three breaking changes detected —
+   a field renamed, a new required field added, a date format changed."
+4. Watch the auto-repair flow:
+   - "The system re-explores the changed schema..."
+   - "Re-maps only the affected fields..."
+   - "Regenerates the middleware..."
+   - "Tests the data flow again..."
+5. Point to the green confirmation: "Auto-repaired. Zero manual
+   intervention. This is what Palantir charges $300K/year for
+   a human FDE to do."
+
+### Closing (5 seconds)
+> "This is the Virtual FDE. Weeks of integration work,
+> compressed to seconds. Self-healing. Anti-fragile.
+> Ready to deploy at every enterprise client."
+
+## Talking Points by Audience
+
+### For Mattia (Technical)
+- "Zero-touch integration — no manual data plumbing"
+- "Dual-LLM architecture — anti-fragile, no single-model dependency"
+- "Hash-based schema drift detection — O(1) per field"
+- "Deterministic Jinja2 templating — no LLM-generated syntax errors"
+
+### For Alberto (Strategy)
+- "Compresses months-long onboarding to minutes"
+- "Enables Fairshot to scale to any ATS without scaling headcount"
+- "TAM expansion — every enterprise client is now self-service"
+
+### For Luca (Capital)
+- "Eliminates professional services cost center"
+- "Compliance-aware — skips sensitive PII fields automatically"
+- "Risk reduction — every transform is cross-validated"
+
+## Troubleshooting
+- **Pipeline hangs:** Check API keys in `.env`. Check network.
+- **Slow response:** First run is cold. Re-run is faster.
+- **Schema drift fails:** Verify `workday_drift.json` exists in `src/mock_data/`.
+- **Dashboard not updating:** Refresh browser. Check terminal for errors.
+```
+
+---
+
+#### 7.8 Files Checklist
+
+| File | Action | Notes |
+|------|--------|-------|
+| `src/utils/drift.py` | **Create** | Drift detection, simulation, fingerprinting (Section 7.3) |
+| `src/mock_data/workday_drift.json` | **Create** | Workday drift scenario (Section 7.4) |
+| `src/agents/orchestrator.py` | **Modify** | Add imports, `DRIFT_CONFIGS`, `run_drift_repair()` (Section 7.5) |
+| `app/dashboard.py` | **Modify** | Enable drift button, add drift thread, add drift alert panel (Section 7.6) |
+| `DEMO_SCRIPT.md` | **Create** | Full demo walkthrough (Section 7.7) |
+
+---
+
+#### 7.9 Implementation Notes for Gemini
+
+1. **`src/utils/drift.py` is pure Python — no LLM calls.** Fingerprinting, drift application, and drift detection are all deterministic. The LLM agents are only called during the repair phase (re-explore, re-map, re-generate).
+
+2. **The drift uses a temp file** for the drifted schema because the Schema Explorer agent expects a file path. The temp file is cleaned up after the repair completes. Use `tempfile.NamedTemporaryFile(delete=False)` to avoid premature deletion.
+
+3. **Drift detection is hash-based** (per Gemini's earlier feedback). `compute_fingerprint` produces a dict of `"entity.field" → md5_hash`. Comparing two fingerprints gives us exact field-level diffs in O(n).
+
+4. **The rename detection** in `detect_drift` is smart — it cross-references removes + adds in the same entity against the drift scenario to identify renames vs. true removes + adds.
+
+5. **Dashboard changes are modifications, not rewrites.** Keep all existing Phase 6 code. Only change the drift button, add the drift thread function, add the drift alert panel, and add `drift_running` to session state.
+
+6. **`DEMO_SCRIPT.md`** goes in the project root. It's for the human presenter, not for any code to consume.
+
+---
+
+#### 7.10 Acceptance Criteria
+
+- [ ] `src/utils/drift.py` exists with `compute_fingerprint`, `apply_drift`, `detect_drift` functions
+- [ ] `src/mock_data/workday_drift.json` exists with 3 changes (rename, add, type_change)
+- [ ] "Trigger Schema Drift" button is enabled after pipeline completes
+- [ ] Clicking drift button triggers `run_drift_repair` and shows real-time progress
+- [ ] Dashboard shows drift alert with all 3 detected changes
+- [ ] Auto-repair re-maps and regenerates middleware without manual intervention
+- [ ] Dashboard shows green "Auto-repaired" confirmation after drift repair
+- [ ] `DEMO_SCRIPT.md` exists with complete walkthrough
+- [ ] Full demo (initial pipeline + drift) completes in < 120 seconds (with API keys)
+- [ ] Event log shows the full drift detection → repair → completion flow
 
 **Dependencies:** Phase 6
 

@@ -29,12 +29,12 @@ def get_gemini_client() -> genai.Client:
 
 def get_openai_model() -> str:
     """Returns the configured OpenAI model name."""
-    return os.getenv("OPENAI_MODEL", "gpt-4o")
+    return os.getenv("OPENAI_MODEL", "gpt-5.3-codex")
 
 
 def get_gemini_model() -> str:
     """Returns the Gemini model string."""
-    return os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+    return os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
 
 def validate_api_keys() -> dict[str, bool]:

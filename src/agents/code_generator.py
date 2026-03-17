@@ -358,5 +358,5 @@ def create_code_generator() -> Agent:
         instructions=CODE_GENERATOR_INSTRUCTIONS,
         tools=[render_middleware, run_test, validate_gemini, load_sample],
         output_type=TransformSpec,
-        model="gpt-4o",
+        model="gpt-5.3-codex",
     )

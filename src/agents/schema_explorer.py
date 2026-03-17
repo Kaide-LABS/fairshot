@@ -3,6 +3,7 @@ import logging
 from typing import Any
 from agents import Agent, function_tool
 from src.models import SchemaReport, ATSField, FieldType
+from src.utils.llm_providers import get_openai_model
 
 logger = logging.getLogger(__name__)
 
@@ -89,5 +90,5 @@ For Oracle (relational), infer relationships from naming conventions and explici
 ''',
         tools=[read_schema_file, list_endpoints, inspect_field],
         output_type=SchemaReport,
-        model="gpt-4o"
+        model="gpt-5.4",
     )
