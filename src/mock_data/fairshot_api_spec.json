@@ -1,0 +1,106 @@
+{
+  "api_name": "Fairshot Talent Assessment API",
+  "api_version": "v1",
+  "base_url": "https://api.fairshot.ai/v1",
+  "auth_type": "Bearer",
+  "endpoints": {
+    "create_candidate": {
+      "method": "POST",
+      "path": "/api/v1/candidates",
+      "description": "Create or update a candidate profile",
+      "request_body": {
+        "candidate_id": { "type": "string", "required": false, "description": "Auto-generated if omitted" },
+        "first_name": { "type": "string", "required": true },
+        "last_name": { "type": "string", "required": true },
+        "email": { "type": "string", "required": true, "format": "email" },
+        "phone": { "type": "string", "required": false, "format": "E.164" },
+        "location": {
+          "type": "object",
+          "required": false,
+          "fields": {
+            "city": { "type": "string" },
+            "state": { "type": "string" },
+            "country": { "type": "string", "format": "ISO 3166-1 alpha-2" },
+            "postal_code": { "type": "string" }
+          }
+        },
+        "education": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "institution": { "type": "string" },
+            "degree": { "type": "string", "enum": ["BS", "BA", "MS", "MBA", "PhD", "Other"] },
+            "field_of_study": { "type": "string" },
+            "graduation_date": { "type": "string", "format": "ISO 8601 date" }
+          }
+        },
+        "experience": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "company": { "type": "string" },
+            "title": { "type": "string" },
+            "start_date": { "type": "string", "format": "ISO 8601 date" },
+            "end_date": { "type": "string", "format": "ISO 8601 date", "nullable": true },
+            "description": { "type": "string" }
+          }
+        },
+        "source_channel": { "type": "string", "required": false, "enum": ["linkedin", "indeed", "referral", "direct", "other"] },
+        "tags": { "type": "array", "required": false, "items": { "type": "string" } },
+        "metadata": { "type": "object", "required": false }
+      }
+    },
+    "schedule_simulation": {
+      "method": "POST",
+      "path": "/api/v1/simulations",
+      "description": "Schedule an AI case simulation for a candidate",
+      "request_body": {
+        "simulation_id": { "type": "string", "required": false },
+        "candidate_id": { "type": "string", "required": true },
+        "job_id": { "type": "string", "required": true },
+        "simulation_type": { "type": "string", "required": true, "enum": ["case_study", "technical", "behavioral", "mixed"] },
+        "difficulty_level": { "type": "string", "required": false, "enum": ["junior", "mid", "senior", "executive"] },
+        "scheduled_at": { "type": "string", "required": true, "format": "ISO 8601 datetime" },
+        "duration_minutes": { "type": "integer", "required": false, "default": 60 },
+        "language": { "type": "string", "required": false, "default": "en" },
+        "custom_parameters": { "type": "object", "required": false }
+      }
+    },
+    "get_requisition": {
+      "method": "GET",
+      "path": "/api/v1/requisitions/{id}",
+      "description": "Retrieve job requisition details",
+      "response_body": {
+        "job_id": { "type": "string" },
+        "title": { "type": "string" },
+        "department": { "type": "string" },
+        "hiring_manager": { "type": "string" },
+        "location": {
+          "type": "object",
+          "fields": {
+            "city": { "type": "string" },
+            "state": { "type": "string" },
+            "country": { "type": "string" }
+          }
+        },
+        "employment_type": { "type": "string", "enum": ["full_time", "part_time", "contract", "intern"] },
+        "seniority_level": { "type": "string", "enum": ["junior", "mid", "senior", "executive"] },
+        "required_skills": { "type": "array", "items": { "type": "string" } },
+        "description": { "type": "string" },
+        "status": { "type": "string", "enum": ["open", "closed", "on_hold", "filled"] },
+        "created_at": { "type": "string", "format": "ISO 8601 datetime" },
+        "updated_at": { "type": "string", "format": "ISO 8601 datetime" }
+      }
+    },
+    "health_check": {
+      "method": "GET",
+      "path": "/api/v1/health",
+      "description": "Health check endpoint for integration validation",
+      "response_body": {
+        "status": { "type": "string", "enum": ["ok"] },
+        "version": { "type": "string" },
+        "timestamp": { "type": "string", "format": "ISO 8601 datetime" }
+      }
+    }
+  }
+}

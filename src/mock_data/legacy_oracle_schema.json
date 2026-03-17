@@ -1,0 +1,156 @@
+{
+  "ats_name": "Legacy Oracle HRMS",
+  "ats_version": "11g_R2_CUSTOM",
+  "api_base": null,
+  "auth_type": "DB_DIRECT",
+  "data_format": "CSV_EXPORT",
+  "entities": {
+    "HR_CANDIDATES": {
+      "endpoint": null,
+      "table_name": "HR_CANDIDATES",
+      "description": "Core candidate table - exported nightly as CSV",
+      "primary_key": "CAND_ID_50",
+      "fields": {
+        "CAND_ID_50": { "type": "string", "nullable": false, "max_length": 50 },
+        "CAND_FIRST_NAME_50": { "type": "string", "nullable": false, "max_length": 50 },
+        "CAND_LAST_NAME_50": { "type": "string", "nullable": false, "max_length": 50 },
+        "CAND_EMAIL_100": { "type": "string", "nullable": false, "max_length": 100 },
+        "CAND_PHONE_20": { "type": "string", "nullable": true, "max_length": 20 },
+        "CAND_ADDR_CITY_50": { "type": "string", "nullable": true, "max_length": 50 },
+        "CAND_ADDR_STATE_10": { "type": "string", "nullable": true, "max_length": 10 },
+        "CAND_ADDR_COUNTRY_5": { "type": "string", "nullable": true, "max_length": 5 },
+        "CAND_ADDR_ZIP_10": { "type": "string", "nullable": true, "max_length": 10 },
+        "CAND_SOURCE_CD_20": { "type": "string", "nullable": true, "max_length": 20 },
+        "CAND_STATUS_CD_10": { "type": "string", "nullable": false, "max_length": 10, "enum": ["NEW", "ACTIVE", "HIRED", "REJECT", "WDRAWN"] },
+        "CAND_CREATED_DT": { "type": "string", "nullable": false, "format": "YYYY-MM-DD" },
+        "CAND_MODIFIED_DT": { "type": "string", "nullable": false, "format": "YYYY-MM-DD" }
+      },
+      "sample_records": [
+        {
+          "CAND_ID_50": "ORA-CAND-000001",
+          "CAND_FIRST_NAME_50": "Priya",
+          "CAND_LAST_NAME_50": "Sharma",
+          "CAND_EMAIL_100": "priya.sharma@outlook.com",
+          "CAND_PHONE_20": "+91-98765-43210",
+          "CAND_ADDR_CITY_50": "Bangalore",
+          "CAND_ADDR_STATE_10": "KA",
+          "CAND_ADDR_COUNTRY_5": "IN",
+          "CAND_ADDR_ZIP_10": "560001",
+          "CAND_SOURCE_CD_20": "NAUKRI",
+          "CAND_STATUS_CD_10": "ACTIVE",
+          "CAND_CREATED_DT": "2024-08-15",
+          "CAND_MODIFIED_DT": "2024-11-30"
+        },
+        {
+          "CAND_ID_50": "ORA-CAND-000002",
+          "CAND_FIRST_NAME_50": "David",
+          "CAND_LAST_NAME_50": "Kim",
+          "CAND_EMAIL_100": "d.kim@samsung.com",
+          "CAND_PHONE_20": "+82-10-1234-5678",
+          "CAND_ADDR_CITY_50": "Seoul",
+          "CAND_ADDR_STATE_10": null,
+          "CAND_ADDR_COUNTRY_5": "KR",
+          "CAND_ADDR_ZIP_10": "06164",
+          "CAND_SOURCE_CD_20": "AGENCY",
+          "CAND_STATUS_CD_10": "NEW",
+          "CAND_CREATED_DT": "2024-11-20",
+          "CAND_MODIFIED_DT": "2024-11-20"
+        }
+      ]
+    },
+    "HR_REQUISITIONS": {
+      "endpoint": null,
+      "table_name": "HR_REQUISITIONS",
+      "description": "Job requisitions table",
+      "primary_key": "REQ_ID_50",
+      "fields": {
+        "REQ_ID_50": { "type": "string", "nullable": false, "max_length": 50 },
+        "REQ_TITLE_200": { "type": "string", "nullable": false, "max_length": 200 },
+        "REQ_DEPT_CD_20": { "type": "string", "nullable": false, "max_length": 20 },
+        "REQ_HMGR_ID_50": { "type": "string", "nullable": false, "max_length": 50, "foreign_key": "HR_EMPLOYEES.EMP_ID_50" },
+        "REQ_CITY_50": { "type": "string", "nullable": true, "max_length": 50 },
+        "REQ_COUNTRY_5": { "type": "string", "nullable": true, "max_length": 5 },
+        "REQ_TYPE_CD_5": { "type": "string", "nullable": false, "max_length": 5, "enum": ["FT", "PT", "CT", "INT"] },
+        "REQ_LEVEL_CD_10": { "type": "string", "nullable": false, "max_length": 10, "enum": ["JR", "MID", "SR", "LEAD", "DIR", "VP", "EXEC"] },
+        "REQ_SKILLS_500": { "type": "string", "nullable": true, "max_length": 500, "format": "comma_delimited" },
+        "REQ_DESC_4000": { "type": "string", "nullable": true, "max_length": 4000 },
+        "REQ_STATUS_CD_10": { "type": "string", "nullable": false, "max_length": 10, "enum": ["OPEN", "HOLD", "FILLED", "CANCEL"] },
+        "REQ_CREATED_DT": { "type": "string", "nullable": false, "format": "YYYY-MM-DD" },
+        "REQ_MODIFIED_DT": { "type": "string", "nullable": false, "format": "YYYY-MM-DD" }
+      },
+      "sample_records": [
+        {
+          "REQ_ID_50": "ORA-REQ-2024-0001",
+          "REQ_TITLE_200": "Senior Data Engineer",
+          "REQ_DEPT_CD_20": "ENGINEERING",
+          "REQ_HMGR_ID_50": "ORA-EMP-000045",
+          "REQ_CITY_50": "Bangalore",
+          "REQ_COUNTRY_5": "IN",
+          "REQ_TYPE_CD_5": "FT",
+          "REQ_LEVEL_CD_10": "SR",
+          "REQ_SKILLS_500": "Python,Spark,Airflow,SQL,AWS",
+          "REQ_DESC_4000": "Looking for a senior data engineer to lead our data platform team...",
+          "REQ_STATUS_CD_10": "OPEN",
+          "REQ_CREATED_DT": "2024-10-01",
+          "REQ_MODIFIED_DT": "2024-11-15"
+        }
+      ]
+    },
+    "HR_APPLICATIONS": {
+      "endpoint": null,
+      "table_name": "HR_APPLICATIONS",
+      "description": "Application records linking candidates to requisitions",
+      "primary_key": "APP_ID_50",
+      "fields": {
+        "APP_ID_50": { "type": "string", "nullable": false, "max_length": 50 },
+        "CAND_ID_50": { "type": "string", "nullable": false, "max_length": 50, "foreign_key": "HR_CANDIDATES.CAND_ID_50" },
+        "REQ_ID_50": { "type": "string", "nullable": false, "max_length": 50, "foreign_key": "HR_REQUISITIONS.REQ_ID_50" },
+        "APP_STATUS_CD_10": { "type": "string", "nullable": false, "max_length": 10, "enum": ["NEW", "SCREEN", "REVIEW", "INTERV", "OFFER", "HIRED", "REJECT"] },
+        "APP_SUBMITTED_DT": { "type": "string", "nullable": false, "format": "YYYY-MM-DD" },
+        "APP_MODIFIED_DT": { "type": "string", "nullable": false, "format": "YYYY-MM-DD" }
+      },
+      "sample_records": [
+        {
+          "APP_ID_50": "ORA-APP-000001",
+          "CAND_ID_50": "ORA-CAND-000001",
+          "REQ_ID_50": "ORA-REQ-2024-0001",
+          "APP_STATUS_CD_10": "REVIEW",
+          "APP_SUBMITTED_DT": "2024-08-20",
+          "APP_MODIFIED_DT": "2024-11-30"
+        }
+      ]
+    },
+    "HR_CANDIDATE_EDUCATION": {
+      "endpoint": null,
+      "table_name": "HR_CANDIDATE_EDUCATION",
+      "description": "Education history - one row per degree",
+      "primary_key": "EDU_ID_50",
+      "fields": {
+        "EDU_ID_50": { "type": "string", "nullable": false, "max_length": 50 },
+        "CAND_ID_50": { "type": "string", "nullable": false, "max_length": 50, "foreign_key": "HR_CANDIDATES.CAND_ID_50" },
+        "EDU_INSTITUTION_200": { "type": "string", "nullable": false, "max_length": 200 },
+        "EDU_DEGREE_CD_10": { "type": "string", "nullable": false, "max_length": 10, "enum": ["HS", "AS", "BS", "BA", "MS", "MBA", "PHD", "JD", "MD", "OTH"] },
+        "EDU_FIELD_100": { "type": "string", "nullable": true, "max_length": 100 },
+        "EDU_GRAD_DT": { "type": "string", "nullable": true, "format": "YYYY-MM-DD" }
+      },
+      "sample_records": [
+        {
+          "EDU_ID_50": "ORA-EDU-000001",
+          "CAND_ID_50": "ORA-CAND-000001",
+          "EDU_INSTITUTION_200": "Indian Institute of Technology Bombay",
+          "EDU_DEGREE_CD_10": "BS",
+          "EDU_FIELD_100": "Computer Science",
+          "EDU_GRAD_DT": "2018-06-15"
+        },
+        {
+          "EDU_ID_50": "ORA-EDU-000002",
+          "CAND_ID_50": "ORA-CAND-000001",
+          "EDU_INSTITUTION_200": "Carnegie Mellon University",
+          "EDU_DEGREE_CD_10": "MS",
+          "EDU_FIELD_100": "Machine Learning",
+          "EDU_GRAD_DT": "2020-05-20"
+        }
+      ]
+    }
+  }
+}
