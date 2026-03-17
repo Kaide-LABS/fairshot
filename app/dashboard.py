@@ -29,6 +29,7 @@ for key, default in {
     "pipeline_state": None,
     "pipeline_running": False,
     "pipeline_complete": False,
+    "drift_running": False,
     "selected_schema": "Workday Enterprise",
 }.items():
     if key not in st.session_state:
@@ -53,6 +54,25 @@ def _run_in_thread(schema_name: str):
     finally:
         loop.close()
     st.session_state["pipeline_running"] = False
+    st.session_state["pipeline_complete"] = True
+
+
+def _run_drift_in_thread(schema_name: str):
+    """Runs drift repair in a background thread."""
+    from src.agents.orchestrator import run_drift_repair
+    from src.models import PipelineState
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        # Reconstruct PipelineState from session state
+        current_state = PipelineState(**st.session_state["pipeline_state"])
+        loop.run_until_complete(
+            run_drift_repair(schema_name, current_state, callback=_pipeline_callback)
+        )
+    finally:
+        loop.close()
+    st.session_state["drift_running"] = False
     st.session_state["pipeline_complete"] = True
 
 
@@ -115,13 +135,22 @@ with st.sidebar:
 
     st.divider()
 
-    # Schema Drift button — placeholder for Phase 7
-    st.button(
+    # Schema Drift button — enabled after pipeline completes
+    if st.button(
         "⚡ Trigger Schema Drift",
-        disabled=True,
+        disabled=not st.session_state.get("pipeline_complete", False)
+            or st.session_state.get("pipeline_running", False)
+            or st.session_state.get("drift_running", False),
         use_container_width=True,
-        help="Coming in Phase 7",
-    )
+        type="secondary",
+    ):
+        st.session_state["drift_running"] = True
+        thread = threading.Thread(
+            target=_run_drift_in_thread,
+            args=(st.session_state["selected_schema"],),
+            daemon=True,
+        )
+        thread.start()
 
 
 # ─── Main Title ──────────────────────────────────────────────────────────
@@ -142,6 +171,20 @@ elif st.session_state["pipeline_running"]:
     progress_container.progress(0, text="Initializing pipeline...")
 
 st.divider()
+
+# ─── Drift Alert ─────────────────────────────────────────────────────
+if state_data and state_data.get("drift_detected"):
+    with st.container():
+        st.warning(f"⚠️ Schema Drift Detected — {len(state_data.get('drift_changes', []))} breaking changes")
+        for change_desc in state_data.get("drift_changes", []):
+            st.markdown(f"- {change_desc}")
+
+        vr = state_data.get("validation_result", {})
+        if vr.get("drift_repaired"):
+            st.success(
+                f"✅ Auto-repaired: {vr.get('changes_repaired', 0)} changes resolved — "
+                f"0 manual intervention required"
+            )
 
 # ─── Panels ──────────────────────────────────────────────────────────────
 

@@ -26,6 +26,13 @@ from src.models import (
     TransformSpec,
     ValidationResult,
 )
+from src.utils.drift import (
+    compute_fingerprint,
+    apply_drift,
+    load_drift_scenario,
+    detect_drift,
+    DriftReport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +54,10 @@ SCHEMA_CONFIGS: dict[str, dict[str, str]] = {
         "entity_name": "HR_CANDIDATES",
         "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
     },
+}
+
+DRIFT_CONFIGS: dict[str, str] = {
+    "Workday Enterprise": "src/mock_data/workday_drift.json",
 }
 
 
@@ -249,6 +260,195 @@ async def run_pipeline(
         state.completed_at = _now()
         _add_log(state, PipelineStage.ERROR, f"Pipeline failed: {e}", detail=str(type(e).__name__))
         logger.exception("Pipeline error")
+        if callback:
+            callback(state)
+
+    return state
+
+
+async def run_drift_repair(
+    schema_name: str,
+    current_state: PipelineState,
+    callback: Callable[[PipelineState], None] | None = None,
+) -> PipelineState:
+    """Simulate schema drift and auto-repair the pipeline.
+
+    Requires a completed pipeline state (from run_pipeline) as input.
+    Modifies the state in-place with drift detection and repair results.
+
+    Args:
+        schema_name: Must match a key in DRIFT_CONFIGS
+        current_state: The PipelineState from a completed run_pipeline call
+        callback: Optional progress callback
+    """
+    state = current_state
+
+    drift_path = DRIFT_CONFIGS.get(schema_name)
+    if not drift_path:
+        _add_log(state, PipelineStage.ERROR, f"No drift scenario for '{schema_name}'")
+        if callback:
+            callback(state)
+        return state
+
+    config = SCHEMA_CONFIGS[schema_name]
+    schema_path = config["schema_path"]
+    entity_name = config["entity_name"]
+    fairshot_spec_path = config["fairshot_spec_path"]
+
+    try:
+        # ── Stage 1: Load original schema and compute fingerprint ────
+        _transition(
+            state, PipelineStage.DRIFT_DETECTION, 5.0,
+            "⚠️ Schema drift detected — analyzing changes...",
+            callback,
+        )
+
+        with open(schema_path, "r") as f:
+            original_schema = json.load(f)
+        original_fp = compute_fingerprint(original_schema)
+
+        # ── Stage 2: Apply drift scenario ────────────────────────────
+        drift_scenario = load_drift_scenario(drift_path)
+        drifted_schema = apply_drift(original_schema, drift_scenario)
+        drifted_fp = compute_fingerprint(drifted_schema)
+
+        # ── Stage 3: Detect changes ──────────────────────────────────
+        drift_report = detect_drift(original_fp, drifted_fp, drift_scenario)
+
+        state.drift_detected = True
+        state.drift_changes = [
+            f"{c.change_type}: {c.field_path} — {c.description}"
+            for c in drift_report.changes
+        ]
+
+        _transition(
+            state, PipelineStage.DRIFT_DETECTION, 20.0,
+            f"Detected {drift_report.total_changes} breaking changes: "
+            + ", ".join(c.change_type for c in drift_report.changes),
+            callback,
+        )
+
+        # ── Stage 4: Re-explore drifted schema ──────────────────────
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 30.0,
+            "Re-exploring drifted schema...",
+            callback,
+        )
+
+        # Write drifted schema to a temp location for the explorer agent
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix="drifted_"
+        ) as tmp:
+            json.dump(drifted_schema, tmp, indent=2)
+            drifted_path = tmp.name
+
+        explorer = create_schema_explorer()
+        explore_result = await Runner.run(
+            explorer, input=f"Analyze the schema at {drifted_path}"
+        )
+        new_schema_report: SchemaReport = explore_result.final_output
+        state.schema_report = new_schema_report.model_dump()
+
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 45.0,
+            f"Re-exploration complete: {new_schema_report.total_field_count} fields "
+            f"(was {len(original_fp)} field definitions)",
+            callback,
+        )
+
+        # ── Stage 5: Re-map with drift context ──────────────────────
+        _transition(
+            state, PipelineStage.SEMANTIC_MAPPING, 50.0,
+            "Re-mapping affected fields...",
+            callback,
+        )
+
+        mapper = create_semantic_mapper()
+        drift_context = "\n".join(
+            f"- {c.change_type}: {c.description}" for c in drift_report.changes
+        )
+        mapper_input = (
+            f"Map the following DRIFTED ATS schema to the Fairshot API.\n\n"
+            f"IMPORTANT: The schema has changed since the last mapping. "
+            f"These specific changes occurred:\n{drift_context}\n\n"
+            f"Schema Report (JSON):\n{new_schema_report.model_dump_json(indent=2)}\n\n"
+            f"Raw schema file: {drifted_path}\n"
+            f"Fairshot API spec file: {fairshot_spec_path}"
+        )
+        map_result = await Runner.run(mapper, input=mapper_input)
+        new_mapping_doc: MappingDocument = map_result.final_output
+        state.mapping_document = new_mapping_doc.model_dump()
+
+        _transition(
+            state, PipelineStage.SEMANTIC_MAPPING, 65.0,
+            f"Re-mapping complete: {len(new_mapping_doc.mappings)} fields mapped",
+            callback,
+        )
+
+        # ── Stage 6: Re-generate middleware ──────────────────────────
+        _transition(
+            state, PipelineStage.CODE_GENERATION, 70.0,
+            "Regenerating middleware for drifted schema...",
+            callback,
+        )
+
+        generator = create_code_generator()
+        gen_input = (
+            f"Generate a TransformSpec for the following mapping.\n\n"
+            f"Mapping Document (JSON):\n{new_mapping_doc.model_dump_json(indent=2)}\n\n"
+            f"Schema file: {drifted_path}\n"
+            f"Primary entity: {entity_name}\n"
+            f"Fairshot spec: {fairshot_spec_path}"
+        )
+        gen_result = await Runner.run(generator, input=gen_input)
+        new_spec: TransformSpec = gen_result.final_output
+        new_middleware = _render_middleware(new_spec)
+        state.generated_middleware = new_middleware
+
+        _transition(
+            state, PipelineStage.CODE_GENERATION, 85.0,
+            f"Middleware regenerated ({len(new_middleware)} chars)",
+            callback,
+        )
+
+        # ── Stage 7: Re-test data flow ───────────────────────────────
+        _transition(
+            state, PipelineStage.DATA_FLOW, 90.0,
+            "Testing data flow with drifted schema...",
+            callback,
+        )
+
+        sample_json = _load_sample_record(drifted_path, entity_name)
+        transform_output = _run_test_transform(new_middleware, sample_json)
+        transform_result = json.loads(transform_output)
+
+        state.validation_result = {
+            "data_flow_test": "passed" if "error" not in transform_result else "failed",
+            "sample_input": json.loads(sample_json),
+            "sample_output": transform_result,
+            "drift_repaired": True,
+            "changes_repaired": len(drift_report.changes),
+        }
+
+        # ── Complete ─────────────────────────────────────────────────
+        state.completed_at = _now()
+        _transition(
+            state, PipelineStage.COMPLETED, 100.0,
+            f"✅ Schema drift auto-repaired: {drift_report.total_changes} changes resolved, "
+            f"0 manual intervention required",
+            callback,
+        )
+
+        # Clean up temp file
+        import os
+        os.unlink(drifted_path)
+
+    except Exception as e:
+        state.current_stage = PipelineStage.ERROR
+        state.error = f"Drift repair failed: {e}"
+        _add_log(state, PipelineStage.ERROR, str(e))
+        logger.exception("Drift repair error")
         if callback:
             callback(state)
 

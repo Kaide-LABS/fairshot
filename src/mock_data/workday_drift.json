@@ -1,0 +1,35 @@
+{
+  "drift_name": "Workday Q1 2025 Schema Update",
+  "description": "Simulates a Workday platform update that renames, adds, and changes fields",
+  "changes": [
+    {
+      "type": "rename",
+      "entity": "WD_Candidate_Profile",
+      "old_field": "Custom_Req_ID_v3_Final",
+      "new_field": "Requisition_Reference_ID",
+      "description": "Workday deprecated the v3 custom field naming convention"
+    },
+    {
+      "type": "add",
+      "entity": "WD_Candidate_Profile",
+      "field": "compliance_region",
+      "field_def": {
+        "type": "string",
+        "nullable": false,
+        "enum": ["EMEA", "APAC", "AMERICAS", "GLOBAL"]
+      },
+      "sample_value": "EMEA",
+      "description": "New mandatory compliance field added in Q1 2025 regulatory update"
+    },
+    {
+      "type": "type_change",
+      "entity": "WD_Candidate_Profile",
+      "field": "cand_dob_dt",
+      "old_type": "string",
+      "old_format": "MM/DD/YYYY",
+      "new_type": "string",
+      "new_format": "ISO8601",
+      "description": "Date format standardized to ISO 8601 across all Workday date fields"
+    }
+  ]
+}
