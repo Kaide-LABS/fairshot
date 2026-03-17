@@ -2307,44 +2307,1093 @@ No other files need modification. The models (`MappingDocument`, `FieldMapping`,
 
 ---
 
-### Phase 4: Code Generator + Gemini Cross-Validation
+### Phase 4: Code Generator + Gemini Cross-Validation — DETAILED SPEC
 
-**Goal:** Implement the Code Generator agent that produces Python middleware from a `MappingDocument`, then validates it with Gemini.
+**Goal:** Take a `MappingDocument` (from Phase 3) and produce working Python middleware that transforms ATS records into Fairshot API payloads. Cross-validate the output with Gemini 2.5 Pro.
 
-**Scope:**
-- Set up agent definition in `src/agents/code_generator.py`
-- Define agent tools:
-  - `generate_transform_function(mapping: FieldMapping) -> str` — generates Python code for a single transform
-  - `assemble_middleware(functions: list[str]) -> str` — combines transforms into a complete module
-  - `validate_with_gemini(code: str, mapping: MappingDocument) -> ValidationResult` — sends to Gemini for review
-  - `run_test_transform(middleware_code: str, sample_input: dict) -> dict` — executes generated code against sample data
-- Integrate Gemini 2.5 Pro via LiteLLM in `src/utils/llm_providers.py`
-- Write unit tests in `tests/test_code_generator.py`
+**Dependencies:** Phase 3 (Semantic Mapper must produce valid `MappingDocument` objects). Phase 1's `src/utils/llm_providers.py` already has `get_gemini_client()` and `get_gemini_model()`.
 
-**Implementation details:**
-- Generated middleware should be a standalone Python module with:
-  - Individual transform functions per field (e.g., `def transform_first_name(record: dict) -> str`)
-  - A main `transform(record: dict) -> dict` function that applies all transforms
-  - Type conversion helpers (date parsing, enum mapping, etc.)
-  - Null/missing field handling
-- Gemini validation prompt should include:
-  - The generated code
-  - The mapping document (for reference)
-  - A sample input record
-  - Instructions to check for: correctness, edge cases, data loss, code quality
-- If Gemini flags critical issues, the agent should revise (max 2 iterations)
+---
 
-**Files to create/modify:**
-- `src/agents/code_generator.py`
-- `src/utils/llm_providers.py` (update with Gemini config)
-- `tests/test_code_generator.py`
+#### 4.1 Architecture Overview — JSON Transform Spec + Jinja2 Templating
 
-**Acceptance criteria:**
-- [ ] Agent generates valid, executable Python middleware
-- [ ] Generated middleware correctly transforms a sample Workday record to Fairshot format
-- [ ] Gemini cross-validation runs and returns a `ValidationResult`
-- [ ] Gemini's feedback is incorporated (if issues found)
-- [ ] `pytest tests/test_code_generator.py` passes
+**Critical design decision (from Gemini cross-agent feedback):** The LLM does NOT generate raw Python code. Instead:
+
+1. The **GPT-4o agent** outputs a **JSON transform spec** — a structured list of transform operations per field
+2. A **deterministic Jinja2 template engine** renders the JSON spec into a valid Python middleware module
+3. **Gemini 2.5 Pro** reviews the generated Python for correctness
+
+This eliminates the #1 demo-failure risk: LLM-hallucinated syntax errors, bad indentation, or missing imports.
+
+```
+MappingDocument ──► GPT-4o Agent ──► TransformSpec (JSON)
+                                          │
+                                    Jinja2 Template
+                                          │
+                                    middleware.py (Python)
+                                          │
+                                    Gemini 2.5 Pro Review
+                                          │
+                                    ValidationResult
+```
+
+---
+
+#### 4.2 New Data Model: `TransformSpec`
+
+Add to `src/models/validation.py` (extends existing file):
+
+```python
+# Add these to src/models/validation.py, after the existing ValidationResult class
+
+class TransformOperation(BaseModel):
+    """A single deterministic transform operation."""
+    fairshot_field: str = Field(description="Target field in Fairshot API (dot-notation for nested)")
+    ats_source_path: str = Field(description="Source field path in ATS record (dot-notation)")
+    transform_type: str = Field(description="One of the predefined transform types")
+    params: dict = Field(
+        default_factory=dict,
+        description="Transform-specific parameters (e.g., date_format, enum_map, delimiter)"
+    )
+    is_array_item: bool = Field(
+        default=False,
+        description="True if this transform applies inside an array (e.g., education[], experience[])"
+    )
+    array_source_path: str = Field(
+        default="",
+        description="If is_array_item, the path to the source array (e.g., 'education_history')"
+    )
+    array_target_path: str = Field(
+        default="",
+        description="If is_array_item, the path to the target array (e.g., 'education')"
+    )
+    nullable: bool = Field(default=True, description="Whether to skip if source value is None")
+
+
+class TransformSpec(BaseModel):
+    """Complete transform specification output by the Code Generator agent.
+    This is the structured intermediate representation between the LLM
+    and the Jinja2 template engine."""
+    ats_name: str
+    transforms: list[TransformOperation]
+    custom_code_blocks: list[str] = Field(
+        default_factory=list,
+        description="Any custom Python snippets the agent deems necessary (escape hatch)"
+    )
+    notes: str = Field(default="", description="Agent notes about edge cases or assumptions")
+```
+
+Also update `src/models/__init__.py` to export:
+```python
+from .validation import Severity, ValidationIssue, ValidationResult, TransformOperation, TransformSpec
+```
+
+---
+
+#### 4.3 Predefined Transform Types
+
+The Jinja2 template knows how to render these transform types. The agent MUST use only these (plus `custom` as an escape hatch):
+
+| Transform Type | Params | Behavior |
+|---|---|---|
+| `direct_copy` | (none) | Copy value as-is |
+| `lowercase_enum` | `enum_map: dict` (optional) | Lowercase the value. If `enum_map` provided, use it for explicit mapping (e.g., `{"LINKEDIN_APPLY": "linkedin"}`) |
+| `date_mmddyyyy_to_iso` | (none) | Parse `MM/DD/YYYY` → `YYYY-MM-DD` |
+| `epoch_to_iso` | (none) | Unix epoch (int) → `YYYY-MM-DD` |
+| `nested_extract` | `path: str` | Extract value from nested dict using dot-path |
+| `semicolon_to_list` | (none) | `"a;b;c"` → `["a", "b", "c"]` |
+| `json_string_to_list` | (none) | `'["a","b"]'` → `["a", "b"]` |
+| `phone_to_e164` | (none) | Strip non-numeric chars except leading `+` |
+| `numeric_enum` | `enum_map: dict` | Map integer codes to strings (e.g., `{1: "linkedin", 3: "referral"}`) |
+| `varchar_strip` | `suffix_pattern: str` | Strip VARCHAR length suffix (e.g., `_50`, `_100`) from field name (Oracle) |
+| `custom` | `code: str` | Raw Python expression (escape hatch — Gemini will scrutinize these) |
+
+---
+
+#### 4.4 Jinja2 Middleware Template
+
+Create `src/templates/middleware.py.j2`:
+
+```python
+"""
+Auto-generated middleware: {{ ats_name }} → Fairshot API
+Generated by Virtual FDE Code Generator
+"""
+
+from datetime import datetime, timezone
+from typing import Any, Optional
+import json
+
+
+# ─── Transform Helpers ───────────────────────────────────────────────────
+
+def _safe_get(record: dict, path: str, default: Any = None) -> Any:
+    """Safely extract a value from a nested dict using dot-notation path."""
+    keys = path.split(".")
+    current = record
+    for key in keys:
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        else:
+            return default
+    return current
+
+
+def _direct_copy(value: Any) -> Any:
+    return value
+
+
+def _lowercase_enum(value: Any, enum_map: dict | None = None) -> str | None:
+    if value is None:
+        return None
+    if enum_map and str(value) in enum_map:
+        return enum_map[str(value)]
+    return str(value).lower().replace("_", " ").split("_")[0] if value else None
+
+
+def _date_mmddyyyy_to_iso(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.strptime(value, "%m/%d/%Y")
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return value
+
+
+def _epoch_to_iso(value: int | float | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(int(value), tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _semicolon_to_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(";") if item.strip()]
+
+
+def _json_string_to_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _phone_to_e164(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = ""
+    for ch in value:
+        if ch.isdigit() or (ch == "+" and not cleaned):
+            cleaned += ch
+    return cleaned if cleaned else None
+
+
+def _numeric_enum(value: Any, enum_map: dict | None = None) -> str | None:
+    if value is None:
+        return None
+    if enum_map and str(value) in enum_map:
+        return enum_map[str(value)]
+    return str(value)
+
+
+# ─── Main Transform Function ────────────────────────────────────────────
+
+def transform(record: dict) -> dict:
+    """Transform a raw {{ ats_name }} record into a Fairshot API payload."""
+    output = {}
+
+    {% for t in transforms %}
+    {% if not t.is_array_item %}
+    # {{ t.fairshot_field }} ← {{ t.ats_source_path }} ({{ t.transform_type }})
+    {% if t.transform_type == "direct_copy" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    {% if t.nullable %}
+    if _val is not None:
+        {% endif %}
+        _set_nested(output, "{{ t.fairshot_field }}", _direct_copy(_val))
+    {% elif t.transform_type == "lowercase_enum" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    if _val is not None:
+        _set_nested(output, "{{ t.fairshot_field }}", _lowercase_enum(_val, {{ t.params.get('enum_map', 'None') }}))
+    {% elif t.transform_type == "date_mmddyyyy_to_iso" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    if _val is not None:
+        _set_nested(output, "{{ t.fairshot_field }}", _date_mmddyyyy_to_iso(_val))
+    {% elif t.transform_type == "epoch_to_iso" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    if _val is not None:
+        _set_nested(output, "{{ t.fairshot_field }}", _epoch_to_iso(_val))
+    {% elif t.transform_type == "nested_extract" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    if _val is not None:
+        _set_nested(output, "{{ t.fairshot_field }}", _val)
+    {% elif t.transform_type == "semicolon_to_list" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    _set_nested(output, "{{ t.fairshot_field }}", _semicolon_to_list(_val))
+    {% elif t.transform_type == "json_string_to_list" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    _set_nested(output, "{{ t.fairshot_field }}", _json_string_to_list(_val))
+    {% elif t.transform_type == "phone_to_e164" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    if _val is not None:
+        _set_nested(output, "{{ t.fairshot_field }}", _phone_to_e164(_val))
+    {% elif t.transform_type == "numeric_enum" %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+    if _val is not None:
+        _set_nested(output, "{{ t.fairshot_field }}", _numeric_enum(_val, {{ t.params.get('enum_map', 'None') }}))
+    {% elif t.transform_type == "custom" %}
+    # Custom transform
+    {{ t.params.get('code', 'pass') }}
+    {% endif %}
+
+    {% endif %}
+    {% endfor %}
+
+    # ─── Array Transforms ────────────────────────────────────────────
+    {% set array_groups = {} %}
+    {% for t in transforms if t.is_array_item %}
+    {% if t.array_target_path not in array_groups %}
+    {% set _ = array_groups.update({t.array_target_path: []}) %}
+    {% endif %}
+    {% set _ = array_groups[t.array_target_path].append(t) %}
+    {% endfor %}
+
+    {% for target_array, items in array_groups.items() %}
+    # Array: {{ items[0].array_source_path }} → {{ target_array }}
+    _source_arr = _safe_get(record, "{{ items[0].array_source_path }}", [])
+    if isinstance(_source_arr, list):
+        _target_arr = []
+        for _item in _source_arr:
+            _mapped = {}
+            {% for t in items %}
+            # {{ t.fairshot_field }} ← {{ t.ats_source_path }}
+            {% set field_key = t.ats_source_path.split(".")[-1] %}
+            _arr_val = _item.get("{{ field_key }}")
+            {% if t.transform_type == "direct_copy" %}
+            if _arr_val is not None:
+                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _direct_copy(_arr_val)
+            {% elif t.transform_type == "date_mmddyyyy_to_iso" %}
+            if _arr_val is not None:
+                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _date_mmddyyyy_to_iso(_arr_val)
+            {% elif t.transform_type == "epoch_to_iso" %}
+            if _arr_val is not None:
+                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _epoch_to_iso(_arr_val)
+            {% elif t.transform_type == "lowercase_enum" %}
+            if _arr_val is not None:
+                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _lowercase_enum(_arr_val, {{ t.params.get('enum_map', 'None') }})
+            {% endif %}
+            {% endfor %}
+            _target_arr.append(_mapped)
+        output["{{ target_array }}"] = _target_arr
+
+    {% endfor %}
+
+    {% for block in custom_code_blocks %}
+    # Custom code block
+    {{ block }}
+    {% endfor %}
+
+    return output
+
+
+def _set_nested(d: dict, path: str, value: Any) -> None:
+    """Set a value in a nested dict using dot-notation path."""
+    keys = path.split(".")
+    for key in keys[:-1]:
+        if key not in d:
+            d[key] = {}
+        d = d[key]
+    d[keys[-1]] = value
+```
+
+> **Note for Gemini:** This template is complex. Copy it exactly as specified. The Jinja2 control flow handles both flat field transforms and array transforms (education, experience). The `_set_nested` helper enables dot-notation output paths like `location.city`.
+
+---
+
+#### 4.5 File: `src/agents/code_generator.py`
+
+```python
+"""
+Code Generator Agent — Phase 4
+
+Takes a MappingDocument from the Semantic Mapper, produces a TransformSpec
+(JSON), renders it into Python middleware via Jinja2, and cross-validates
+with Gemini 2.5 Pro.
+"""
+
+import json
+import logging
+import os
+from typing import Any
+
+from agents import Agent, function_tool
+from jinja2 import Environment, FileSystemLoader
+
+from src.models import (
+    MappingDocument,
+    TransformSpec,
+    TransformOperation,
+    ValidationResult,
+    ValidationIssue,
+    Severity,
+)
+from src.utils.llm_providers import get_gemini_client, get_gemini_model
+
+logger = logging.getLogger(__name__)
+
+# ─── Jinja2 Setup ────────────────────────────────────────────────────────
+
+TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "..", "templates")
+
+
+def _render_middleware(transform_spec: TransformSpec) -> str:
+    """Render a TransformSpec into a Python middleware module using Jinja2.
+
+    This is a deterministic, non-LLM operation. The template is static;
+    only the data (TransformSpec) varies.
+    """
+    env = Environment(
+        loader=FileSystemLoader(TEMPLATE_DIR),
+        keep_trailing_newline=True,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    template = env.get_template("middleware.py.j2")
+    return template.render(
+        ats_name=transform_spec.ats_name,
+        transforms=transform_spec.transforms,
+        custom_code_blocks=transform_spec.custom_code_blocks,
+    )
+
+
+# ─── Tool 1: Render Middleware ───────────────────────────────────────────
+
+
+def _render_middleware_from_spec(transform_spec_json: str) -> str:
+    """Take a TransformSpec as JSON, render it into Python middleware code
+    via the Jinja2 template, and return the generated Python source.
+
+    Args:
+        transform_spec_json: A TransformSpec serialized as JSON string.
+    """
+    try:
+        spec = TransformSpec.model_validate_json(transform_spec_json)
+        code = _render_middleware(spec)
+        return code
+    except Exception as e:
+        logger.error(f"Failed to render middleware: {e}")
+        return f"Error rendering middleware: {e}"
+
+
+# ─── Tool 2: Test Transform ─────────────────────────────────────────────
+
+
+def _run_test_transform(middleware_code: str, sample_input_json: str) -> str:
+    """Execute the generated middleware code against a sample input record
+    and return the transformed output. Uses exec() in a sandboxed namespace.
+
+    Args:
+        middleware_code: The generated Python middleware source code.
+        sample_input_json: A sample ATS record as a JSON string.
+    """
+    try:
+        sample_input = json.loads(sample_input_json)
+
+        # Execute middleware in isolated namespace
+        namespace: dict[str, Any] = {}
+        exec(middleware_code, namespace)
+
+        transform_fn = namespace.get("transform")
+        if not transform_fn:
+            return json.dumps({"error": "No 'transform' function found in generated code"})
+
+        result = transform_fn(sample_input)
+        return json.dumps(result, indent=2, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e), "error_type": type(e).__name__})
+
+
+# ─── Tool 3: Gemini Cross-Validation ────────────────────────────────────
+
+
+def _validate_with_gemini(
+    middleware_code: str,
+    mapping_document_json: str,
+    sample_input_json: str,
+    transform_output_json: str,
+) -> str:
+    """Send the generated middleware + mapping context to Gemini 2.5 Pro
+    for independent cross-validation. Returns a ValidationResult as JSON.
+
+    Args:
+        middleware_code: The generated Python middleware source code.
+        mapping_document_json: The MappingDocument as JSON (for reference).
+        sample_input_json: The sample ATS input record as JSON.
+        transform_output_json: The output produced by running the middleware.
+    """
+    try:
+        client = get_gemini_client()
+        model = get_gemini_model()
+
+        prompt = f"""You are a senior code reviewer specializing in data integration middleware.
+
+Review the following auto-generated Python middleware that transforms ATS records into Fairshot API payloads.
+
+## Generated Middleware Code
+```python
+{middleware_code}
+```
+
+## Field Mapping Reference
+```json
+{mapping_document_json}
+```
+
+## Sample Input (ATS Record)
+```json
+{sample_input_json}
+```
+
+## Transform Output
+```json
+{transform_output_json}
+```
+
+## Review Checklist
+1. **Correctness**: Does each transform match the mapping specification?
+2. **Edge cases**: How does the code handle null values, empty strings, missing fields?
+3. **Date handling**: Are date conversions correct (MM/DD/YYYY → ISO, epoch → ISO)?
+4. **Enum mapping**: Are enum translations accurate?
+5. **Data loss**: Are any fields silently dropped or incorrectly mapped?
+6. **Type safety**: Could any transform cause a runtime TypeError?
+
+## Output Format
+Respond with ONLY a JSON object (no markdown, no explanation outside JSON):
+{{
+    "is_valid": true/false,
+    "issues": [
+        {{
+            "severity": "error" | "warning" | "info",
+            "field": "field_name or null",
+            "message": "description of issue",
+            "suggestion": "how to fix or null"
+        }}
+    ],
+    "summary": "One-paragraph overall assessment"
+}}
+"""
+
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+        )
+
+        # Parse Gemini's response into ValidationResult
+        response_text = response.text.strip()
+        # Strip markdown code fences if present
+        if response_text.startswith("```"):
+            response_text = response_text.split("\n", 1)[1]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3].strip()
+
+        parsed = json.loads(response_text)
+
+        result = ValidationResult(
+            is_valid=parsed.get("is_valid", False),
+            issues=[
+                ValidationIssue(
+                    severity=Severity(issue.get("severity", "warning")),
+                    field=issue.get("field"),
+                    message=issue.get("message", ""),
+                    suggestion=issue.get("suggestion"),
+                )
+                for issue in parsed.get("issues", [])
+            ],
+            gemini_summary=parsed.get("summary", "No summary provided"),
+            approved_transforms=sum(
+                1 for i in parsed.get("issues", []) if i.get("severity") == "info"
+            ),
+            flagged_transforms=sum(
+                1 for i in parsed.get("issues", [])
+                if i.get("severity") in ("error", "warning")
+            ),
+        )
+        return result.model_dump_json(indent=2)
+
+    except Exception as e:
+        logger.error(f"Gemini validation failed: {e}")
+        fallback = ValidationResult(
+            is_valid=False,
+            issues=[
+                ValidationIssue(
+                    severity=Severity.ERROR,
+                    message=f"Gemini validation call failed: {e}",
+                )
+            ],
+            gemini_summary=f"Validation failed due to error: {e}",
+            approved_transforms=0,
+            flagged_transforms=1,
+        )
+        return fallback.model_dump_json(indent=2)
+
+
+# ─── Tool 4: Load Sample Record ─────────────────────────────────────────
+
+
+def _load_sample_record(schema_file_path: str, entity_name: str) -> str:
+    """Load the first sample record from a mock schema file for testing.
+
+    Args:
+        schema_file_path: Path to the ATS schema JSON file.
+        entity_name: The entity key (e.g., 'WD_Candidate_Profile').
+    """
+    try:
+        with open(schema_file_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        entity = schema.get("entities", {}).get(entity_name, {})
+        samples = entity.get("sample_records", [])
+        if not samples:
+            return json.dumps({"error": f"No sample records for '{entity_name}'"})
+        return json.dumps(samples[0], indent=2, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ─── Agent Factory ───────────────────────────────────────────────────────
+
+CODE_GENERATOR_INSTRUCTIONS = """\
+You are an expert code generator specializing in data transformation middleware. \
+Your task is to produce a TransformSpec (JSON) that will be rendered into Python \
+middleware via a Jinja2 template.
+
+## IMPORTANT: You do NOT write Python code directly.
+Instead, you produce a structured TransformSpec JSON that describes each \
+transform operation. A deterministic template renders the final Python.
+
+## Your Process
+
+1. You will receive a MappingDocument (JSON) containing field mappings from an \
+   ATS schema to the Fairshot API, along with file paths.
+
+2. For each FieldMapping in the MappingDocument, create a TransformOperation:
+   - Set `fairshot_field` to the Fairshot target field path
+   - Set `ats_source_path` to the ATS source field path
+   - Set `transform_type` to one of the predefined types (see below)
+   - Set `params` with any transform-specific parameters
+   - For array fields (education, experience), set `is_array_item=true` and \
+     populate `array_source_path` and `array_target_path`
+
+3. After building the TransformSpec, call `render_middleware_from_spec` to get \
+   the generated Python code.
+
+4. Call `load_sample_record` to get a test input record.
+
+5. Call `run_test_transform` with the generated code and sample record to verify \
+   the transform works.
+
+6. Call `validate_with_gemini` with the generated code, mapping document, sample \
+   input, and transform output for cross-validation.
+
+7. If Gemini flags ERROR-severity issues, revise your TransformSpec and repeat \
+   steps 3-6 (max 2 revision rounds).
+
+## Predefined Transform Types
+
+| Type | Params | Behavior |
+|------|--------|----------|
+| `direct_copy` | (none) | Pass value through unchanged |
+| `lowercase_enum` | `enum_map` (optional dict) | Lowercase value or use explicit map |
+| `date_mmddyyyy_to_iso` | (none) | MM/DD/YYYY → YYYY-MM-DD |
+| `epoch_to_iso` | (none) | Unix epoch → YYYY-MM-DD |
+| `nested_extract` | (none) | Value is already at the dot-path — just copy |
+| `semicolon_to_list` | (none) | "a;b;c" → ["a","b","c"] |
+| `json_string_to_list` | (none) | '["a"]' → ["a"] |
+| `phone_to_e164` | (none) | Strip non-numeric except leading + |
+| `numeric_enum` | `enum_map` (dict) | Map int codes to strings |
+| `custom` | `code` (str) | Raw Python (escape hatch — use sparingly) |
+
+## Array Field Handling
+
+For array fields like education and experience:
+- Set `is_array_item = true`
+- Set `array_source_path` to the ATS array field (e.g., `education_history`)
+- Set `array_target_path` to the Fairshot array (e.g., `education`)
+- The `ats_source_path` should be the sub-field name within each array item \
+  (e.g., `edu_institution_nm`)
+- The `fairshot_field` should include the array prefix \
+  (e.g., `education.institution`)
+
+## TransformSpec JSON Format
+
+```json
+{
+    "ats_name": "Workday Enterprise HCM",
+    "transforms": [
+        {
+            "fairshot_field": "first_name",
+            "ats_source_path": "cand_nm_first",
+            "transform_type": "direct_copy",
+            "params": {},
+            "is_array_item": false,
+            "array_source_path": "",
+            "array_target_path": "",
+            "nullable": true
+        },
+        {
+            "fairshot_field": "education.institution",
+            "ats_source_path": "edu_institution_nm",
+            "transform_type": "direct_copy",
+            "params": {},
+            "is_array_item": true,
+            "array_source_path": "education_history",
+            "array_target_path": "education",
+            "nullable": true
+        }
+    ],
+    "custom_code_blocks": [],
+    "notes": ""
+}
+```
+
+## Output
+Your final output must be a TransformSpec JSON object. After validation, output \
+the final (possibly revised) TransformSpec.
+"""
+
+
+def create_code_generator() -> Agent:
+    """Create and return the Code Generator agent."""
+    render_middleware = function_tool(_render_middleware_from_spec)
+    run_test = function_tool(_run_test_transform)
+    validate_gemini = function_tool(_validate_with_gemini)
+    load_sample = function_tool(_load_sample_record)
+
+    return Agent(
+        name="Code Generator",
+        instructions=CODE_GENERATOR_INSTRUCTIONS,
+        tools=[render_middleware, run_test, validate_gemini, load_sample],
+        output_type=TransformSpec,
+        model="gpt-4o",
+    )
+```
+
+---
+
+#### 4.6 How to Run the Code Generator
+
+```python
+import asyncio
+import json
+from agents import Runner
+from src.agents.code_generator import create_code_generator, _render_middleware
+from src.models import TransformSpec
+
+async def run_code_gen(mapping_doc_json: str, schema_path: str, entity_name: str):
+    generator = create_code_generator()
+    gen_input = (
+        f"Generate a TransformSpec for the following mapping.\n\n"
+        f"Mapping Document (JSON):\n{mapping_doc_json}\n\n"
+        f"Schema file: {schema_path}\n"
+        f"Primary entity: {entity_name}\n"
+        f"Fairshot spec: src/mock_data/fairshot_api_spec.json"
+    )
+    result = await Runner.run(generator, input=gen_input)
+    transform_spec = result.final_output  # TransformSpec
+
+    # Render final middleware
+    middleware_code = _render_middleware(transform_spec)
+
+    # Optionally save to disk
+    with open("src/middleware/middleware.py", "w") as f:
+        f.write(middleware_code)
+
+    return transform_spec, middleware_code
+```
+
+---
+
+#### 4.7 File: `tests/test_code_generator.py`
+
+```python
+"""
+Tests for the Code Generator agent.
+
+- Template rendering tests (no API key required)
+- Transform helper tests (no API key required)
+- Gemini validation test (requires GOOGLE_API_KEY, skipped otherwise)
+- Agent integration test (requires OPENAI_API_KEY + GOOGLE_API_KEY, skipped otherwise)
+"""
+
+import os
+import json
+import pytest
+from src.models import (
+    TransformSpec,
+    TransformOperation,
+    ValidationResult,
+    MappingDocument,
+    FieldMapping,
+    Confidence,
+)
+from src.agents.code_generator import (
+    _render_middleware,
+    _render_middleware_from_spec,
+    _run_test_transform,
+    _load_sample_record,
+    create_code_generator,
+)
+
+
+# ─── Template Rendering Tests ────────────────────────────────────────────
+
+
+class TestRenderMiddleware:
+    def _make_simple_spec(self) -> TransformSpec:
+        return TransformSpec(
+            ats_name="Test ATS",
+            transforms=[
+                TransformOperation(
+                    fairshot_field="first_name",
+                    ats_source_path="cand_nm_first",
+                    transform_type="direct_copy",
+                ),
+                TransformOperation(
+                    fairshot_field="email",
+                    ats_source_path="cand_email",
+                    transform_type="direct_copy",
+                ),
+            ],
+        )
+
+    def test_renders_valid_python(self):
+        spec = self._make_simple_spec()
+        code = _render_middleware(spec)
+        assert "def transform(record: dict) -> dict:" in code
+        assert "Test ATS" in code
+        # Should compile without syntax errors
+        compile(code, "<test>", "exec")
+
+    def test_renders_date_transform(self):
+        spec = TransformSpec(
+            ats_name="Test",
+            transforms=[
+                TransformOperation(
+                    fairshot_field="graduation_date",
+                    ats_source_path="edu_grad_dt",
+                    transform_type="date_mmddyyyy_to_iso",
+                ),
+            ],
+        )
+        code = _render_middleware(spec)
+        assert "_date_mmddyyyy_to_iso" in code
+        compile(code, "<test>", "exec")
+
+    def test_renders_epoch_transform(self):
+        spec = TransformSpec(
+            ats_name="Test",
+            transforms=[
+                TransformOperation(
+                    fairshot_field="start_date",
+                    ats_source_path="exp_start_dt",
+                    transform_type="epoch_to_iso",
+                ),
+            ],
+        )
+        code = _render_middleware(spec)
+        assert "_epoch_to_iso" in code
+        compile(code, "<test>", "exec")
+
+    def test_renders_array_transforms(self):
+        spec = TransformSpec(
+            ats_name="Test",
+            transforms=[
+                TransformOperation(
+                    fairshot_field="education.institution",
+                    ats_source_path="edu_institution_nm",
+                    transform_type="direct_copy",
+                    is_array_item=True,
+                    array_source_path="education_history",
+                    array_target_path="education",
+                ),
+            ],
+        )
+        code = _render_middleware(spec)
+        assert "education_history" in code
+        assert "education" in code
+        compile(code, "<test>", "exec")
+
+    def test_renders_from_json(self):
+        spec = TransformSpec(
+            ats_name="Test",
+            transforms=[
+                TransformOperation(
+                    fairshot_field="first_name",
+                    ats_source_path="fname",
+                    transform_type="direct_copy",
+                ),
+            ],
+        )
+        code = _render_middleware_from_spec(spec.model_dump_json())
+        assert "def transform" in code
+
+
+# ─── Transform Execution Tests ───────────────────────────────────────────
+
+
+class TestRunTestTransform:
+    def test_simple_direct_copy(self):
+        code = '''
+def transform(record):
+    return {"first_name": record.get("fname")}
+'''
+        result = _run_test_transform(code, '{"fname": "Jane"}')
+        parsed = json.loads(result)
+        assert parsed["first_name"] == "Jane"
+
+    def test_handles_bad_code(self):
+        result = _run_test_transform("def broken(:", '{}')
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+    def test_handles_missing_transform_fn(self):
+        result = _run_test_transform("x = 1", '{}')
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+
+# ─── Sample Record Loading ───────────────────────────────────────────────
+
+
+class TestLoadSampleRecord:
+    def test_loads_workday_sample(self):
+        result = _load_sample_record(
+            "src/mock_data/workday_schema.json", "WD_Candidate_Profile"
+        )
+        record = json.loads(result)
+        assert record["cand_nm_first"] == "Jane"
+        assert record["cand_email_primary_v3_Final"] == "jane.doe@email.com"
+
+    def test_handles_missing_entity(self):
+        result = _load_sample_record(
+            "src/mock_data/workday_schema.json", "Nonexistent"
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+
+# ─── End-to-End Render + Execute ─────────────────────────────────────────
+
+
+class TestEndToEndTransform:
+    """Renders a realistic TransformSpec and executes it against Workday sample data."""
+
+    def test_workday_candidate_transform(self):
+        spec = TransformSpec(
+            ats_name="Workday Enterprise HCM",
+            transforms=[
+                TransformOperation(
+                    fairshot_field="first_name",
+                    ats_source_path="cand_nm_first",
+                    transform_type="direct_copy",
+                ),
+                TransformOperation(
+                    fairshot_field="last_name",
+                    ats_source_path="cand_nm_last",
+                    transform_type="direct_copy",
+                ),
+                TransformOperation(
+                    fairshot_field="email",
+                    ats_source_path="cand_email_primary_v3_Final",
+                    transform_type="direct_copy",
+                ),
+                TransformOperation(
+                    fairshot_field="location.city",
+                    ats_source_path="address_block.addr_city_nm",
+                    transform_type="nested_extract",
+                ),
+                TransformOperation(
+                    fairshot_field="education.institution",
+                    ats_source_path="edu_institution_nm",
+                    transform_type="direct_copy",
+                    is_array_item=True,
+                    array_source_path="education_history",
+                    array_target_path="education",
+                ),
+                TransformOperation(
+                    fairshot_field="education.graduation_date",
+                    ats_source_path="edu_graduation_dt",
+                    transform_type="date_mmddyyyy_to_iso",
+                    is_array_item=True,
+                    array_source_path="education_history",
+                    array_target_path="education",
+                ),
+            ],
+        )
+
+        # Render
+        code = _render_middleware(spec)
+        compile(code, "<test>", "exec")
+
+        # Load sample and execute
+        sample_json = _load_sample_record(
+            "src/mock_data/workday_schema.json", "WD_Candidate_Profile"
+        )
+        result_json = _run_test_transform(code, sample_json)
+        result = json.loads(result_json)
+
+        # Assertions
+        assert result.get("first_name") == "Jane"
+        assert result.get("last_name") == "Doe"
+        assert result.get("email") == "jane.doe@email.com"
+        assert result.get("location", {}).get("city") == "San Francisco"
+        assert len(result.get("education", [])) >= 1
+        assert result["education"][0]["institution"] == "Stanford University"
+        assert result["education"][0]["graduation_date"] == "2020-06-15"
+
+
+# ─── Agent Integration Test ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_code_generator_agent():
+    """Full agent integration test. Requires OPENAI_API_KEY."""
+    if not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "sk-your-openai-key-here":
+        pytest.skip("Skipping agent test — OPENAI_API_KEY not set")
+
+    from agents import Runner
+
+    # Build a minimal MappingDocument for the agent
+    mapping_doc = MappingDocument(
+        ats_name="Workday Enterprise HCM",
+        mappings=[
+            FieldMapping(
+                ats_field="cand_nm_first",
+                fairshot_field="first_name",
+                transform_function="direct_copy",
+                confidence=Confidence.HIGH,
+                confidence_score=0.95,
+                reasoning="cand_nm_first = candidate name first",
+            ),
+            FieldMapping(
+                ats_field="cand_nm_last",
+                fairshot_field="last_name",
+                transform_function="direct_copy",
+                confidence=Confidence.HIGH,
+                confidence_score=0.95,
+                reasoning="cand_nm_last = candidate name last",
+            ),
+            FieldMapping(
+                ats_field="cand_email_primary_v3_Final",
+                fairshot_field="email",
+                transform_function="direct_copy",
+                confidence=Confidence.HIGH,
+                confidence_score=0.92,
+                reasoning="Primary email field",
+            ),
+            FieldMapping(
+                ats_field="address_block.addr_city_nm",
+                fairshot_field="location.city",
+                transform_function="nested_extract",
+                confidence=Confidence.HIGH,
+                confidence_score=0.93,
+                reasoning="Nested address city field",
+            ),
+            FieldMapping(
+                ats_field="source_channel_cd",
+                fairshot_field="source_channel",
+                transform_function="lowercase_enum",
+                confidence=Confidence.MEDIUM,
+                confidence_score=0.85,
+                reasoning="ATS uses UPPERCASE enum codes",
+            ),
+        ],
+        unmapped_ats_fields=["Custom_Diversity_Flag_DO_NOT_USE", "notes_txt_DEPRECATED"],
+        unmapped_fairshot_fields=["candidate_id", "metadata"],
+        overall_confidence=0.92,
+        mapping_coverage=0.85,
+    )
+
+    generator = create_code_generator()
+    gen_input = (
+        f"Generate a TransformSpec for the following mapping.\n\n"
+        f"Mapping Document (JSON):\n{mapping_doc.model_dump_json(indent=2)}\n\n"
+        f"Schema file: src/mock_data/workday_schema.json\n"
+        f"Primary entity: WD_Candidate_Profile\n"
+        f"Fairshot spec: src/mock_data/fairshot_api_spec.json"
+    )
+    result = await Runner.run(generator, input=gen_input)
+    transform_spec = result.final_output
+
+    assert isinstance(transform_spec, TransformSpec)
+    assert len(transform_spec.transforms) >= 4
+    assert transform_spec.ats_name == "Workday Enterprise HCM"
+
+    # Verify the spec can be rendered into valid Python
+    code = _render_middleware(transform_spec)
+    compile(code, "<test>", "exec")
+```
+
+---
+
+#### 4.8 Files Checklist
+
+| File | Action | Notes |
+|------|--------|-------|
+| `src/models/validation.py` | **Modify** | Add `TransformOperation` and `TransformSpec` classes (Section 4.2) |
+| `src/models/__init__.py` | **Modify** | Add `TransformOperation, TransformSpec` to exports |
+| `src/templates/middleware.py.j2` | **Create** | Jinja2 template from Section 4.4 |
+| `src/agents/code_generator.py` | **Create** | Full implementation from Section 4.5 |
+| `tests/test_code_generator.py` | **Create** | Full test suite from Section 4.7 |
+
+No changes needed to `src/utils/llm_providers.py` — Gemini already has `get_gemini_client()` and `get_gemini_model()` from Phase 1.
+
+---
+
+#### 4.9 Implementation Notes for Gemini
+
+1. **Create `src/templates/` directory** — this is new. Add an `__init__.py` if desired, but it's not required (Jinja2 uses `FileSystemLoader`, not Python imports).
+
+2. **The Jinja2 template is the hardest part of this phase.** The template handles:
+   - Flat field transforms (direct_copy, enum mapping, date conversion, etc.)
+   - Nested output fields via `_set_nested()` helper
+   - Array transforms (education, experience) with per-item sub-field mapping
+   - Custom code blocks (escape hatch)
+
+   **Test the template thoroughly** — the `TestEndToEndTransform` class in the test file validates that a rendered template actually executes correctly against Workday sample data.
+
+3. **The `exec()` in `_run_test_transform`** is intentional — this is a demo, not production. The generated code runs in an isolated namespace dict. Do not add `eval()` or `__import__` restrictions — it would break the generated middleware's `import json` and `from datetime import datetime`.
+
+4. **Gemini validation is a single API call** using `google-genai` directly (not LiteLLM). The `_validate_with_gemini` function constructs a prompt, calls `client.models.generate_content()`, and parses the JSON response into a `ValidationResult`. If Gemini's response isn't valid JSON, the function returns a fallback error result.
+
+5. **The agent's `output_type` is `TransformSpec`, not `ValidationResult`.** The agent outputs the structured transform specification. The Gemini validation happens as a side-effect via the tool call. The orchestrator (Phase 5) will extract both the TransformSpec and the ValidationResult from the pipeline.
+
+6. **Follow the existing file patterns:**
+   - Underscore-prefixed private functions for tools
+   - `function_tool()` wrapper in the factory
+   - `create_code_generator()` factory returns the `Agent`
+   - Module-level constants for the instruction prompt
+
+---
+
+#### 4.10 Acceptance Criteria
+
+- [ ] `TransformOperation` and `TransformSpec` models added to `src/models/validation.py` and exported from `src/models/__init__.py`
+- [ ] `src/templates/middleware.py.j2` exists and is a valid Jinja2 template
+- [ ] `pytest tests/test_code_generator.py -v -k "not agent"` passes — all template, execution, and sample-loading tests pass without API keys
+- [ ] `TestEndToEndTransform::test_workday_candidate_transform` passes — proves the full render→execute pipeline works with realistic data
+- [ ] (With OPENAI_API_KEY) Agent produces a valid `TransformSpec` from a MappingDocument
+- [ ] (With OPENAI_API_KEY) Generated TransformSpec renders into syntactically valid Python (`compile()` succeeds)
+- [ ] (With OPENAI_API_KEY + GOOGLE_API_KEY) Gemini cross-validation runs and returns a `ValidationResult`
+- [ ] Generated middleware correctly transforms the Workday sample record (Jane Doe) with correct `first_name`, `last_name`, `email`, and `location.city`
 
 **Dependencies:** Phase 3
 
