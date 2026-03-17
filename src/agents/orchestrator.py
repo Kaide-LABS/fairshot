@@ -1,0 +1,288 @@
+"""
+Deployment Orchestrator — Phase 5
+
+Deterministic pipeline that wires Schema Explorer → Semantic Mapper →
+Code Generator into an end-to-end flow. NOT an LLM agent — just async
+Python coordinating LLM-powered worker agents.
+"""
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+
+from agents import Runner
+
+from src.agents.schema_explorer import create_schema_explorer
+from src.agents.semantic_mapper import create_semantic_mapper
+from src.agents.code_generator import create_code_generator, _render_middleware, _run_test_transform, _load_sample_record
+from src.models import (
+    PipelineState,
+    PipelineStage,
+    LogEntry,
+    SchemaReport,
+    MappingDocument,
+    TransformSpec,
+    ValidationResult,
+)
+
+logger = logging.getLogger(__name__)
+
+# ─── Schema Configs ──────────────────────────────────────────────────────
+
+SCHEMA_CONFIGS: dict[str, dict[str, str]] = {
+    "Workday Enterprise": {
+        "schema_path": "src/mock_data/workday_schema.json",
+        "entity_name": "WD_Candidate_Profile",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+    "SmartRecruiters Lite": {
+        "schema_path": "src/mock_data/smartrecruiters_schema.json",
+        "entity_name": "sr_candidates",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+    "Legacy Oracle": {
+        "schema_path": "src/mock_data/legacy_oracle_schema.json",
+        "entity_name": "HR_CANDIDATES",
+        "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+    },
+}
+
+
+# ─── Pipeline State Helpers ──────────────────────────────────────────────
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _add_log(
+    state: PipelineState,
+    stage: PipelineStage,
+    message: str,
+    detail: str | None = None,
+) -> None:
+    state.logs.append(
+        LogEntry(timestamp=_now(), stage=stage, message=message, detail=detail)
+    )
+
+
+def _transition(
+    state: PipelineState,
+    stage: PipelineStage,
+    progress: float,
+    message: str,
+    callback: Callable[[PipelineState], None] | None = None,
+) -> None:
+    """Update pipeline state and notify callback."""
+    state.current_stage = stage
+    state.progress_percent = progress
+    _add_log(state, stage, message)
+    if callback:
+        callback(state)
+
+
+# ─── Main Pipeline ───────────────────────────────────────────────────────
+
+
+async def run_pipeline(
+    schema_name: str,
+    callback: Callable[[PipelineState], None] | None = None,
+) -> PipelineState:
+    """Run the full integration pipeline for a given ATS schema.
+
+    Args:
+        schema_name: One of the keys in SCHEMA_CONFIGS
+            ("Workday Enterprise", "SmartRecruiters Lite", "Legacy Oracle")
+        callback: Optional function called on every state transition.
+            Signature: callback(state: PipelineState) -> None
+
+    Returns:
+        PipelineState with all artifacts populated.
+    """
+    state = PipelineState(started_at=_now())
+
+    config = SCHEMA_CONFIGS.get(schema_name)
+    if not config:
+        state.current_stage = PipelineStage.ERROR
+        state.error = f"Unknown schema: '{schema_name}'. Valid options: {list(SCHEMA_CONFIGS.keys())}"
+        _add_log(state, PipelineStage.ERROR, state.error)
+        if callback:
+            callback(state)
+        return state
+
+    schema_path = config["schema_path"]
+    entity_name = config["entity_name"]
+    fairshot_spec_path = config["fairshot_spec_path"]
+
+    try:
+        # ── Stage 1: Schema Exploration ──────────────────────────────
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 10.0,
+            f"Starting schema exploration: {schema_name}",
+            callback,
+        )
+
+        explorer = create_schema_explorer()
+        explore_result = await Runner.run(
+            explorer,
+            input=f"Analyze the schema at {schema_path}",
+        )
+        schema_report: SchemaReport = explore_result.final_output
+
+        state.schema_report = schema_report.model_dump()
+        _transition(
+            state, PipelineStage.SCHEMA_EXPLORATION, 30.0,
+            f"Schema exploration complete: {schema_report.total_field_count} fields discovered across {len(schema_report.endpoints)} endpoints",
+            callback,
+        )
+
+        # ── Stage 2: Semantic Mapping ────────────────────────────────
+        _transition(
+            state, PipelineStage.SEMANTIC_MAPPING, 35.0,
+            "Starting semantic mapping",
+            callback,
+        )
+
+        mapper = create_semantic_mapper()
+        mapper_input = (
+            f"Map the following ATS schema to the Fairshot API.\n\n"
+            f"Schema Report (JSON):\n{schema_report.model_dump_json(indent=2)}\n\n"
+            f"Raw schema file: {schema_path}\n"
+            f"Fairshot API spec file: {fairshot_spec_path}"
+        )
+        map_result = await Runner.run(mapper, input=mapper_input)
+        mapping_doc: MappingDocument = map_result.final_output
+
+        state.mapping_document = mapping_doc.model_dump()
+        _transition(
+            state, PipelineStage.SEMANTIC_MAPPING, 55.0,
+            f"Semantic mapping complete: {len(mapping_doc.mappings)} fields mapped, "
+            f"coverage {mapping_doc.mapping_coverage:.0%}, "
+            f"confidence {mapping_doc.overall_confidence:.2f}",
+            callback,
+        )
+
+        # ── Stage 3: Code Generation ────────────────────────────────
+        _transition(
+            state, PipelineStage.CODE_GENERATION, 60.0,
+            "Starting code generation + Gemini cross-validation",
+            callback,
+        )
+
+        generator = create_code_generator()
+        gen_input = (
+            f"Generate a TransformSpec for the following mapping.\n\n"
+            f"Mapping Document (JSON):\n{mapping_doc.model_dump_json(indent=2)}\n\n"
+            f"Schema file: {schema_path}\n"
+            f"Primary entity: {entity_name}\n"
+            f"Fairshot spec: {fairshot_spec_path}"
+        )
+        gen_result = await Runner.run(generator, input=gen_input)
+        transform_spec: TransformSpec = gen_result.final_output
+
+        # Render middleware from the TransformSpec
+        middleware_code = _render_middleware(transform_spec)
+        state.generated_middleware = middleware_code
+
+        _transition(
+            state, PipelineStage.CODE_GENERATION, 80.0,
+            f"Code generation complete: {len(transform_spec.transforms)} transform operations, "
+            f"middleware rendered ({len(middleware_code)} chars)",
+            callback,
+        )
+
+        # ── Stage 4: Data Flow Test ─────────────────────────────────
+        _transition(
+            state, PipelineStage.DATA_FLOW, 85.0,
+            "Running live data flow test",
+            callback,
+        )
+
+        sample_json = _load_sample_record(schema_path, entity_name)
+        transform_output = _run_test_transform(middleware_code, sample_json)
+        transform_result = json.loads(transform_output)
+
+        if "error" in transform_result:
+            _add_log(
+                state, PipelineStage.DATA_FLOW,
+                f"Data flow test failed: {transform_result['error']}",
+                detail=transform_output,
+            )
+        else:
+            mapped_fields = len(transform_result)
+            _add_log(
+                state, PipelineStage.DATA_FLOW,
+                f"Data flow test passed: {mapped_fields} top-level fields in output",
+                detail=transform_output,
+            )
+
+        # Store the validation result if the Code Generator agent ran Gemini
+        # (it's embedded in the agent's tool calls, not directly accessible here,
+        # so we create a basic one from the data flow test)
+        state.validation_result = {
+            "data_flow_test": "passed" if "error" not in transform_result else "failed",
+            "sample_input": json.loads(sample_json) if "error" not in json.loads(sample_json) else sample_json,
+            "sample_output": transform_result,
+            "transform_spec_notes": transform_spec.notes,
+        }
+
+        _transition(
+            state, PipelineStage.DATA_FLOW, 95.0,
+            "Data flow test complete",
+            callback,
+        )
+
+        # ── Complete ────────────────────────────────────────────────
+        state.completed_at = _now()
+        _transition(
+            state, PipelineStage.COMPLETED, 100.0,
+            f"Pipeline complete. Total time: "
+            f"{(state.completed_at - state.started_at).total_seconds():.1f}s",
+            callback,
+        )
+
+    except Exception as e:
+        state.current_stage = PipelineStage.ERROR
+        state.error = str(e)
+        state.completed_at = _now()
+        _add_log(state, PipelineStage.ERROR, f"Pipeline failed: {e}", detail=str(type(e).__name__))
+        logger.exception("Pipeline error")
+        if callback:
+            callback(state)
+
+    return state
+
+
+# ─── CLI Entry Point ─────────────────────────────────────────────────────
+
+
+async def _main():
+    """Run the pipeline from the command line."""
+    import sys
+
+    schema_name = sys.argv[1] if len(sys.argv) > 1 else "Workday Enterprise"
+
+    def _print_callback(state: PipelineState):
+        print(f"[{state.current_stage.value}] {state.progress_percent:.0f}% — {state.logs[-1].message}")
+
+    print(f"\n{'='*60}")
+    print(f"  Virtual FDE — Running pipeline: {schema_name}")
+    print(f"{'='*60}\n")
+
+    state = await run_pipeline(schema_name, callback=_print_callback)
+
+    if state.error:
+        print(f"\n❌ Pipeline failed: {state.error}")
+        sys.exit(1)
+    else:
+        print(f"\n✅ Pipeline completed successfully")
+        print(f"   Fields discovered: {state.schema_report['total_field_count'] if state.schema_report else 'N/A'}")
+        print(f"   Fields mapped: {len(state.mapping_document['mappings']) if state.mapping_document else 'N/A'}")
+        print(f"   Middleware size: {len(state.generated_middleware or '')} chars")
+        print(f"   Total time: {(state.completed_at - state.started_at).total_seconds():.1f}s")
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
