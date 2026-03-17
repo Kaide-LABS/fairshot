@@ -1691,40 +1691,617 @@ Use sample data from the mock schemas above to make the test data realistic.
 
 ---
 
-### Phase 3: Semantic Mapper Agent
+### Phase 3: Semantic Mapper Agent — DETAILED SPEC
 
-**Goal:** Implement the Semantic Mapper agent that takes a `SchemaReport` + Fairshot API spec and produces a `MappingDocument`.
+**Goal:** Implement the Semantic Mapper agent that takes a `SchemaReport` (output of Phase 2's Schema Explorer) + the Fairshot API spec and produces a `MappingDocument` with field-by-field mappings, confidence scores, and reasoning.
 
-**Scope:**
-- Set up agent definition in `src/agents/semantic_mapper.py`
-- Define agent tools:
-  - `load_fairshot_spec(path: str) -> dict` — reads the Fairshot API spec
-  - `compute_similarity(ats_field: str, fairshot_field: str) -> float` — uses LLM to compute semantic similarity
-  - `lookup_field_context(field_name: str, schema: SchemaReport) -> str` — gets surrounding context for a field
-- Agent uses GPT-4o to reason about semantic equivalence between messy ATS fields and clean Fairshot fields
-- Confidence scoring: the agent must justify each mapping with a reasoning string
-- Write unit tests in `tests/test_semantic_mapper.py`
+**Dependencies:** Phase 2 (Schema Explorer must be functional and producing valid `SchemaReport` objects)
 
-**Implementation details:**
-- The agent prompt should include the full Fairshot API spec as context
-- For each Fairshot field, the agent should consider:
-  - Exact name matches (rare)
-  - Semantic equivalence (e.g., `cand_nm_first` → `first_name`)
-  - Abbreviation expansion (e.g., `nm` → name, `cd` → code, `dt` → date)
-  - Path-based matching (e.g., `address_block.addr_city_nm` → `location.city`)
-- Low-confidence mappings should include alternatives
-- Unmappable fields should be explicitly listed
+---
 
-**Files to create/modify:**
-- `src/agents/semantic_mapper.py`
-- `tests/test_semantic_mapper.py`
+#### 3.1 Architecture Overview
 
-**Acceptance criteria:**
-- [ ] Agent maps at least 90% of Fairshot fields from the Workday schema
-- [ ] All mappings include confidence scores and reasoning
-- [ ] Unmapped fields are explicitly listed
-- [ ] Mapping handles nested fields (e.g., `address_block.addr_city_nm` → `location.city`)
-- [ ] `pytest tests/test_semantic_mapper.py` passes
+The Semantic Mapper is an OpenAI Agents SDK agent (`Agent`) with `output_type=MappingDocument`. It receives a serialized `SchemaReport` + the Fairshot API spec as input context, reasons about semantic equivalences between messy ATS fields and clean Fairshot fields, and produces a deterministic `MappingDocument`.
+
+**Key design decision:** The agent does NOT call an LLM per-field for similarity scoring. Instead, it receives the full SchemaReport + Fairshot spec in a single prompt and maps ALL fields in one pass. This keeps latency low (single LLM call) and gives the model full context to resolve ambiguities. The `compute_similarity` tool from the original Phase 3 outline is replaced with a deterministic helper that the agent can optionally call for edge cases.
+
+```
+                  ┌──────────────────────────┐
+                  │    Semantic Mapper Agent  │
+                  │    Model: GPT-4o         │
+                  │    output_type:           │
+                  │      MappingDocument      │
+                  ├──────────────────────────┤
+                  │  Tools:                   │
+                  │  - load_fairshot_spec()   │
+                  │  - get_schema_summary()   │
+                  │  - get_field_samples()    │
+                  └──────────────────────────┘
+                           │
+            Input: SchemaReport (JSON) +
+                   schema file path +
+                   fairshot spec path
+                           │
+            Output: MappingDocument (Pydantic)
+```
+
+---
+
+#### 3.2 File: `src/agents/semantic_mapper.py`
+
+```python
+"""
+Semantic Mapper Agent — Phase 3
+
+Takes a SchemaReport from the Schema Explorer + the Fairshot API spec,
+and produces a MappingDocument with field-by-field mappings, confidence
+scores, and reasoning.
+"""
+
+import json
+import logging
+from typing import Any
+
+from agents import Agent, function_tool
+
+from src.models import (
+    SchemaReport,
+    MappingDocument,
+    FieldMapping,
+    Confidence,
+    ATSField,
+)
+
+logger = logging.getLogger(__name__)
+
+# ─── Tool 1: Load Fairshot API Spec ──────────────────────────────────────
+
+_fairshot_spec_cache: dict[str, dict] = {}
+
+
+def _load_fairshot_spec(path: str) -> str:
+    """Load and return the Fairshot API spec as a JSON string.
+
+    Args:
+        path: File path to the fairshot_api_spec.json file.
+    """
+    try:
+        if path in _fairshot_spec_cache:
+            return json.dumps(_fairshot_spec_cache[path], indent=2)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            _fairshot_spec_cache[path] = data
+            return json.dumps(data, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to load Fairshot spec at {path}: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# ─── Tool 2: Schema Summary Helper ──────────────────────────────────────
+
+
+def _get_schema_summary(schema_report_json: str) -> str:
+    """Parse a SchemaReport JSON and return a concise summary of all fields
+    with their types, paths, and any anomalies. This helps the agent
+    quickly scan all available ATS fields.
+
+    Args:
+        schema_report_json: The SchemaReport serialized as a JSON string.
+    """
+    try:
+        report = SchemaReport.model_validate_json(schema_report_json)
+        lines = [
+            f"ATS: {report.ats_name}",
+            f"Endpoints: {', '.join(report.endpoints)}",
+            f"Total fields: {report.total_field_count}",
+            f"Nesting depth: {report.nesting_depth}",
+            f"Conventions: {', '.join(report.custom_conventions)}",
+            "",
+            "=== ALL FIELDS ===",
+        ]
+        for field in report.fields:
+            anomaly_str = f" [ANOMALIES: {', '.join(field.anomalies)}]" if field.anomalies else ""
+            sample_str = f" (sample: {field.sample_value})" if field.sample_value is not None else ""
+            lines.append(
+                f"  {field.nested_path} | type={field.field_type.value} | "
+                f"nullable={field.nullable}{sample_str}{anomaly_str}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Failed to parse SchemaReport: {e}")
+        return f"Error parsing schema report: {e}"
+
+
+# ─── Tool 3: Field Samples Lookup ───────────────────────────────────────
+
+
+def _get_field_samples(schema_file_path: str, entity_name: str) -> str:
+    """Return sample records for a specific entity from the raw schema file.
+    Useful when the agent needs to inspect actual data values to resolve
+    ambiguous mappings.
+
+    Args:
+        schema_file_path: Path to the original ATS schema JSON file.
+        entity_name: The entity key (e.g., 'WD_Candidate_Profile').
+    """
+    try:
+        with open(schema_file_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        entity = schema.get("entities", {}).get(entity_name, {})
+        samples = entity.get("sample_records", [])
+        if not samples:
+            return f"No sample records found for entity '{entity_name}'"
+        return json.dumps(samples, indent=2, default=str)
+    except Exception as e:
+        return f"Error loading samples: {e}"
+
+
+# ─── Agent Factory ───────────────────────────────────────────────────────
+
+SEMANTIC_MAPPER_INSTRUCTIONS = """\
+You are an expert data integration engineer specializing in enterprise ATS \
+schema mapping. Your task is to produce a complete, deterministic field mapping \
+between a source ATS schema and the Fairshot target API.
+
+## Your Process
+
+1. **Load the Fairshot API spec** using `load_fairshot_spec` to understand ALL \
+   target fields across all endpoints (create_candidate, schedule_simulation, \
+   get_requisition).
+
+2. **Review the Schema Summary** using `get_schema_summary` to see all \
+   discovered ATS fields with their types, paths, and anomalies.
+
+3. **If needed**, use `get_field_samples` to inspect actual sample data values \
+   for ambiguous fields.
+
+4. **Produce a MappingDocument** with the following rules:
+
+## Mapping Rules
+
+For EACH Fairshot target field (from the `create_candidate` endpoint — this is \
+the primary mapping target), find the best matching ATS source field:
+
+- **Exact matches** are rare. Focus on semantic equivalence.
+- **Expand abbreviations**: `nm` = name, `cd` = code, `dt` = date, `ts` = \
+  timestamp, `txt` = text, `addr` = address, `loc` = location, `cand` = \
+  candidate, `req` = requisition, `edu` = education, `exp` = experience, \
+  `mgr` = manager.
+- **Nested paths**: Map nested ATS fields to nested Fairshot fields. E.g., \
+  `WD_Candidate_Profile.address_block.addr_city_nm` → `location.city`.
+- **Array items**: Map array sub-fields individually. E.g., \
+  `education_history[].edu_institution_nm` → `education[].institution`.
+- **Enum translation**: When ATS uses codes (e.g., `LINKEDIN_APPLY`) and \
+  Fairshot uses lowercase (e.g., `linkedin`), note the transform needed.
+- **Date format normalization**: When ATS uses `MM/DD/YYYY` or epoch seconds \
+  and Fairshot expects ISO 8601, note the transform needed.
+- **Skip deprecated/legacy fields**: Fields with `_DEPRECATED`, `_DO_NOT_USE`, \
+  or `_LEGACY` suffixes should NOT be mapped if a non-deprecated alternative \
+  exists for the same data. If a `_LEGACY` field is the ONLY source for a \
+  target field, map it but flag the anomaly.
+
+## Confidence Scoring
+
+- **HIGH (>0.9)**: Clear semantic match. E.g., `cand_nm_first` → `first_name`.
+- **MEDIUM (0.7–0.9)**: Reasonable match requiring transformation. E.g., \
+  `source_channel_cd` → `source_channel` (needs enum normalization).
+- **LOW (<0.7)**: Uncertain match. E.g., `screening_score_v2` → `metadata` \
+  (no direct Fairshot equivalent, stuffed into metadata).
+
+## Transform Function Naming
+
+Name each transform function descriptively:
+- `direct_copy` — field value passes through unchanged
+- `lowercase_enum` — convert ATS enum to Fairshot lowercase equivalent
+- `date_mmddyyyy_to_iso` — convert MM/DD/YYYY to ISO 8601
+- `epoch_to_iso` — convert Unix epoch seconds to ISO 8601 date
+- `nested_extract` — extract value from a nested object path
+- `semicolon_to_list` — split semicolon-delimited string into array
+- `json_string_to_list` — parse a JSON array string into actual array
+- `phone_to_e164` — normalize phone to E.164 format
+- `custom_[description]` — any other transform
+
+## Output Requirements
+
+- Map ALL fields in the Fairshot `create_candidate` endpoint
+- Also map `job_id` from `get_requisition` (for the simulation scheduling flow)
+- List ALL unmapped ATS fields in `unmapped_ats_fields`
+- List any unmapped Fairshot fields in `unmapped_fairshot_fields`
+- Calculate `overall_confidence` as the mean of all `confidence_score` values
+- Calculate `mapping_coverage` as: mapped_fairshot_fields / total_fairshot_fields
+
+## CRITICAL
+- You MUST use the provided tools. Do NOT guess the schema or spec contents.
+- Every mapping MUST include a `reasoning` string explaining WHY this match \
+  was chosen.
+- DO NOT map the same ATS field to multiple Fairshot fields unless it genuinely \
+  serves both (e.g., `Custom_Req_ID_v3_Final` → `job_id`).
+"""
+
+
+def create_semantic_mapper() -> Agent:
+    """Create and return the Semantic Mapper agent."""
+    load_fairshot_spec = function_tool(_load_fairshot_spec)
+    get_schema_summary = function_tool(_get_schema_summary)
+    get_field_samples = function_tool(_get_field_samples)
+
+    return Agent(
+        name="Semantic Mapper",
+        instructions=SEMANTIC_MAPPER_INSTRUCTIONS,
+        tools=[load_fairshot_spec, get_schema_summary, get_field_samples],
+        output_type=MappingDocument,
+        model="gpt-4o",
+    )
+```
+
+---
+
+#### 3.3 How to Run the Semantic Mapper
+
+The Semantic Mapper agent is invoked by passing it a message containing:
+1. The serialized `SchemaReport` JSON (from Phase 2's Schema Explorer output)
+2. The file paths for the raw schema and Fairshot API spec
+
+**Example invocation (for testing or from the orchestrator):**
+
+```python
+import asyncio
+import json
+from agents import Runner
+from src.agents.schema_explorer import create_schema_explorer
+from src.agents.semantic_mapper import create_semantic_mapper
+
+async def run_mapping():
+    # Step 1: Run Schema Explorer (Phase 2)
+    explorer = create_schema_explorer()
+    explore_result = await Runner.run(
+        explorer,
+        input="Analyze the schema at src/mock_data/workday_schema.json"
+    )
+    schema_report = explore_result.final_output  # SchemaReport
+
+    # Step 2: Run Semantic Mapper (Phase 3)
+    mapper = create_semantic_mapper()
+    mapper_input = (
+        f"Map the following ATS schema to the Fairshot API.\n\n"
+        f"Schema Report (JSON):\n{schema_report.model_dump_json(indent=2)}\n\n"
+        f"Raw schema file: src/mock_data/workday_schema.json\n"
+        f"Fairshot API spec file: src/mock_data/fairshot_api_spec.json"
+    )
+    map_result = await Runner.run(mapper, input=mapper_input)
+    mapping_doc = map_result.final_output  # MappingDocument
+
+    print(f"Mapped {len(mapping_doc.mappings)} fields")
+    print(f"Coverage: {mapping_doc.mapping_coverage:.0%}")
+    print(f"Confidence: {mapping_doc.overall_confidence:.2f}")
+
+asyncio.run(run_mapping())
+```
+
+---
+
+#### 3.4 Expected Mappings (Workday → Fairshot Reference)
+
+This table serves as the ground truth for testing. The agent should produce mappings substantially matching these:
+
+| ATS Field (Workday) | Fairshot Field | Transform | Expected Confidence |
+|---|---|---|---|
+| `cand_nm_first` | `first_name` | `direct_copy` | HIGH (0.95) |
+| `cand_nm_last` | `last_name` | `direct_copy` | HIGH (0.95) |
+| `cand_email_primary_v3_Final` | `email` | `direct_copy` | HIGH (0.92) |
+| `cand_phone_mobile_INTL` | `phone` | `phone_to_e164` | MEDIUM (0.85) |
+| `address_block.addr_city_nm` | `location.city` | `nested_extract` | HIGH (0.93) |
+| `address_block.addr_state_province` | `location.state` | `nested_extract` | HIGH (0.93) |
+| `address_block.addr_country_iso` | `location.country` | `nested_extract` | HIGH (0.95) |
+| `address_block.addr_postal_cd` | `location.postal_code` | `nested_extract` | HIGH (0.93) |
+| `education_history[].edu_institution_nm` | `education[].institution` | `direct_copy` | HIGH (0.94) |
+| `education_history[].edu_degree_type_cd` | `education[].degree` | `lowercase_enum` | MEDIUM (0.88) |
+| `education_history[].edu_field_of_study` | `education[].field_of_study` | `direct_copy` | HIGH (0.95) |
+| `education_history[].edu_graduation_dt` | `education[].graduation_date` | `date_mmddyyyy_to_iso` | MEDIUM (0.85) |
+| `work_experience_LEGACY[].exp_company_nm` | `experience[].company` | `direct_copy` | HIGH (0.90) |
+| `work_experience_LEGACY[].exp_title` | `experience[].title` | `direct_copy` | HIGH (0.92) |
+| `work_experience_LEGACY[].exp_start_dt` | `experience[].start_date` | `epoch_to_iso` | MEDIUM (0.80) |
+| `work_experience_LEGACY[].exp_end_dt` | `experience[].end_date` | `epoch_to_iso` | MEDIUM (0.80) |
+| `work_experience_LEGACY[].exp_description_txt` | `experience[].description` | `direct_copy` | HIGH (0.92) |
+| `source_channel_cd` | `source_channel` | `lowercase_enum` | MEDIUM (0.85) |
+| `cand_skills_tags_txt` | `tags` | `semicolon_to_list` | MEDIUM (0.78) |
+| `Custom_Req_ID_v3_Final` | `job_id` | `direct_copy` | HIGH (0.90) |
+
+**Expected unmapped ATS fields** (should appear in `unmapped_ats_fields`):
+- `cand_nm_middle_initial` — no Fairshot equivalent
+- `cand_email_secondary_DEPRECATED` — deprecated
+- `cand_phone_home_LEGACY` — deprecated, mobile already mapped
+- `Custom_Diversity_Flag_DO_NOT_USE` — explicitly flagged
+- `cand_gender_cd` — no Fairshot equivalent (sensitive PII)
+- `cand_dob_dt` — no Fairshot equivalent (sensitive PII)
+- `internal_candidate_flag` — no Fairshot equivalent
+- `recruiter_assigned_id` — no Fairshot equivalent
+- `screening_score_v2` — could go to `metadata`, but low confidence
+- `notes_txt_DEPRECATED` — deprecated
+- `cand_profile_url_txt` — no Fairshot equivalent
+- `cand_resume_blob_id` — no Fairshot equivalent
+- `application_status_cd` — no direct Fairshot candidate field
+- `application_submitted_dt` — no direct Fairshot candidate field
+- `cand_preferred_lang_cd` — no Fairshot equivalent
+- `cand_timezone_v2_Final` — no Fairshot equivalent
+- `last_modified_ts` — no Fairshot equivalent
+- `edu_gpa_val_LEGACY` — deprecated, no Fairshot equivalent
+
+**Expected unmapped Fairshot fields** (should appear in `unmapped_fairshot_fields`):
+- `candidate_id` — auto-generated by Fairshot, no ATS source needed
+- `metadata` — optional catch-all, not directly mappable
+
+---
+
+#### 3.5 File: `tests/test_semantic_mapper.py`
+
+```python
+"""
+Tests for the Semantic Mapper agent.
+
+- Tool-level unit tests (no API key required)
+- Agent integration test (requires OPENAI_API_KEY, skipped otherwise)
+"""
+
+import os
+import json
+import pytest
+from src.agents.semantic_mapper import (
+    _load_fairshot_spec,
+    _get_schema_summary,
+    _get_field_samples,
+    create_semantic_mapper,
+)
+from src.models import (
+    SchemaReport,
+    MappingDocument,
+    ATSField,
+    FieldType,
+    Confidence,
+)
+
+
+# ─── Tool Unit Tests ─────────────────────────────────────────────────────
+
+
+class TestLoadFairshotSpec:
+    def test_loads_valid_spec(self):
+        result = _load_fairshot_spec("src/mock_data/fairshot_api_spec.json")
+        spec = json.loads(result)
+        assert spec["api_name"] == "Fairshot Talent Assessment API"
+        assert "create_candidate" in spec["endpoints"]
+        assert "schedule_simulation" in spec["endpoints"]
+        assert "get_requisition" in spec["endpoints"]
+        assert "health_check" in spec["endpoints"]
+
+    def test_spec_has_required_fields(self):
+        result = _load_fairshot_spec("src/mock_data/fairshot_api_spec.json")
+        spec = json.loads(result)
+        candidate_fields = spec["endpoints"]["create_candidate"]["request_body"]
+        # Verify key target fields exist
+        assert "first_name" in candidate_fields
+        assert "last_name" in candidate_fields
+        assert "email" in candidate_fields
+        assert "location" in candidate_fields
+        assert "education" in candidate_fields
+        assert "experience" in candidate_fields
+        assert "source_channel" in candidate_fields
+        assert "tags" in candidate_fields
+
+    def test_handles_missing_file(self):
+        result = _load_fairshot_spec("nonexistent.json")
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+    def test_caches_on_second_load(self):
+        """Second load should use cache."""
+        _load_fairshot_spec("src/mock_data/fairshot_api_spec.json")
+        result2 = _load_fairshot_spec("src/mock_data/fairshot_api_spec.json")
+        spec = json.loads(result2)
+        assert spec["api_name"] == "Fairshot Talent Assessment API"
+
+
+class TestGetSchemaSummary:
+    def _make_sample_report(self) -> SchemaReport:
+        return SchemaReport(
+            ats_name="Test ATS",
+            endpoints=["/api/test"],
+            fields=[
+                ATSField(
+                    name="test_field",
+                    field_type=FieldType.STRING,
+                    nullable=False,
+                    sample_value="hello",
+                    nested_path="entity.test_field",
+                    anomalies=["_v3_Final suffix"],
+                ),
+                ATSField(
+                    name="another_field",
+                    field_type=FieldType.INTEGER,
+                    nullable=True,
+                    nested_path="entity.another_field",
+                ),
+            ],
+            total_field_count=2,
+            nesting_depth=1,
+            custom_conventions=["_v3_Final suffix pattern"],
+        )
+
+    def test_produces_readable_summary(self):
+        report = self._make_sample_report()
+        summary = _get_schema_summary(report.model_dump_json())
+        assert "Test ATS" in summary
+        assert "test_field" in summary
+        assert "another_field" in summary
+        assert "string" in summary
+        assert "_v3_Final suffix" in summary
+
+    def test_shows_sample_values(self):
+        report = self._make_sample_report()
+        summary = _get_schema_summary(report.model_dump_json())
+        assert "hello" in summary
+
+    def test_handles_invalid_json(self):
+        result = _get_schema_summary("not valid json")
+        assert "Error" in result
+
+
+class TestGetFieldSamples:
+    def test_returns_workday_samples(self):
+        result = _get_field_samples(
+            "src/mock_data/workday_schema.json", "WD_Candidate_Profile"
+        )
+        samples = json.loads(result)
+        assert isinstance(samples, list)
+        assert len(samples) >= 2
+        assert samples[0]["cand_nm_first"] == "Jane"
+
+    def test_returns_smartrecruiters_samples(self):
+        result = _get_field_samples(
+            "src/mock_data/smartrecruiters_schema.json", "sr_candidates"
+        )
+        samples = json.loads(result)
+        assert isinstance(samples, list)
+        assert len(samples) >= 2
+
+    def test_handles_missing_entity(self):
+        result = _get_field_samples(
+            "src/mock_data/workday_schema.json", "NonexistentEntity"
+        )
+        assert "No sample records" in result
+
+
+# ─── Agent Integration Test ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_semantic_mapper_agent():
+    """Full agent integration test against the Workday schema.
+    Requires OPENAI_API_KEY to be set.
+    """
+    if not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "sk-your-openai-key-here":
+        pytest.skip("Skipping agent test — OPENAI_API_KEY not set")
+
+    from agents import Runner
+    from src.agents.schema_explorer import create_schema_explorer
+
+    # Step 1: Get a SchemaReport from the Explorer
+    explorer = create_schema_explorer()
+    explore_result = await Runner.run(
+        explorer,
+        input="Analyze the schema at src/mock_data/workday_schema.json",
+    )
+    schema_report = explore_result.final_output
+    assert isinstance(schema_report, SchemaReport)
+
+    # Step 2: Run the Semantic Mapper
+    mapper = create_semantic_mapper()
+    mapper_input = (
+        f"Map the following ATS schema to the Fairshot API.\n\n"
+        f"Schema Report (JSON):\n{schema_report.model_dump_json(indent=2)}\n\n"
+        f"Raw schema file: src/mock_data/workday_schema.json\n"
+        f"Fairshot API spec file: src/mock_data/fairshot_api_spec.json"
+    )
+    map_result = await Runner.run(mapper, input=mapper_input)
+    mapping_doc = map_result.final_output
+
+    # ── Assertions ──
+    assert isinstance(mapping_doc, MappingDocument)
+    assert mapping_doc.ats_name == "Workday Enterprise HCM"
+
+    # Must have mappings
+    assert len(mapping_doc.mappings) >= 15, (
+        f"Expected at least 15 mappings, got {len(mapping_doc.mappings)}"
+    )
+
+    # Coverage should be >= 90%
+    assert mapping_doc.mapping_coverage >= 0.85, (
+        f"Expected coverage >= 85%, got {mapping_doc.mapping_coverage:.0%}"
+    )
+
+    # Every mapping must have reasoning
+    for m in mapping_doc.mappings:
+        assert m.reasoning, f"Mapping {m.ats_field} → {m.fairshot_field} has no reasoning"
+        assert 0.0 <= m.confidence_score <= 1.0
+
+    # Check critical mappings exist
+    fairshot_fields_mapped = {m.fairshot_field for m in mapping_doc.mappings}
+    for required_field in ["first_name", "last_name", "email"]:
+        assert required_field in fairshot_fields_mapped, (
+            f"Critical field '{required_field}' was not mapped"
+        )
+
+    # Check nested mapping exists (location.city)
+    location_fields = {m.fairshot_field for m in mapping_doc.mappings if "location" in m.fairshot_field}
+    assert len(location_fields) >= 1, "No location fields were mapped"
+
+    # Check unmapped fields exist
+    assert len(mapping_doc.unmapped_ats_fields) > 0, "Should have unmapped ATS fields"
+
+    # Deprecated fields should be in unmapped (or mapped with anomaly noted)
+    deprecated_keywords = ["DEPRECATED", "DO_NOT_USE"]
+    all_mapped_ats = {m.ats_field for m in mapping_doc.mappings}
+    for ats_field in all_mapped_ats:
+        for kw in deprecated_keywords:
+            if kw in ats_field:
+                # If a deprecated field IS mapped, it should be low confidence
+                matching = [m for m in mapping_doc.mappings if m.ats_field == ats_field]
+                for m in matching:
+                    assert m.confidence_score < 0.9, (
+                        f"Deprecated field {ats_field} mapped with high confidence"
+                    )
+```
+
+---
+
+#### 3.6 Files Checklist
+
+| File | Action | Notes |
+|------|--------|-------|
+| `src/agents/semantic_mapper.py` | Create | Full implementation from Section 3.2 |
+| `tests/test_semantic_mapper.py` | Create | Full test suite from Section 3.5 |
+
+No other files need modification. The models (`MappingDocument`, `FieldMapping`, `Confidence`) already exist from Phase 1. The Schema Explorer from Phase 2 is consumed as-is.
+
+---
+
+#### 3.7 Implementation Notes for Gemini
+
+1. **Copy the code from 3.2 verbatim** — the agent instructions, tools, and factory function are fully specified. Do not change the tool signatures or the agent instructions.
+
+2. **The `_get_schema_summary` tool** is the key innovation vs. the original Phase 3 spec. Instead of per-field LLM calls, the agent gets a pre-formatted summary of ALL fields and maps them in one reasoning pass. This keeps latency to a single LLM round-trip.
+
+3. **The `_get_field_samples` tool** is optional — the agent calls it only when it needs to inspect actual data values to resolve ambiguous mappings (e.g., figuring out that `sr_cnd_src_cd: 1` means "LinkedIn").
+
+4. **Follow the existing patterns from Phase 2** (`schema_explorer.py`):
+   - Underscore-prefixed private functions for tools (`_load_fairshot_spec`)
+   - `function_tool()` wrapper in the factory function
+   - `create_semantic_mapper()` factory returns the `Agent` instance
+   - Module-level cache dicts for file I/O
+
+5. **The agent prompt is long and detailed** — this is intentional. GPT-4o needs explicit instructions for:
+   - Abbreviation expansion rules (the ATS schemas use heavy abbreviations)
+   - Transform function naming conventions (these names are used by Phase 4's Code Generator)
+   - Confidence scoring thresholds
+   - How to handle deprecated fields
+
+6. **Do NOT add `diskcache` or caching in this phase** — that's Phase 5/6 territory. Keep this phase focused on the agent itself.
+
+---
+
+#### 3.8 Acceptance Criteria
+
+- [ ] `src/agents/semantic_mapper.py` exists and exports `create_semantic_mapper()`
+- [ ] `pytest tests/test_semantic_mapper.py -v -k "not agent"` passes — all tool-level unit tests pass without an API key
+- [ ] (With API key) Agent processes the Workday schema and returns a valid `MappingDocument`
+- [ ] (With API key) At least 15 field mappings are produced
+- [ ] (With API key) `first_name`, `last_name`, `email` are all mapped
+- [ ] (With API key) At least one `location.*` field is mapped (nested field handling)
+- [ ] (With API key) At least one `education[].*` field is mapped (array field handling)
+- [ ] (With API key) Every mapping has a non-empty `reasoning` string
+- [ ] (With API key) Deprecated/DO_NOT_USE fields are either unmapped or mapped with low confidence
+- [ ] (With API key) `mapping_coverage >= 85%`
+- [ ] (With API key) `unmapped_ats_fields` is non-empty (deprecated fields should appear here)
 
 **Dependencies:** Phase 2
 
