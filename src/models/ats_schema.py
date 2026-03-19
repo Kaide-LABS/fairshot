@@ -18,7 +18,7 @@ class ATSField(BaseModel):
     name: str = Field(description="Raw field name as it appears in the ATS")
     field_type: FieldType = Field(description="Detected data type")
     nullable: bool = Field(default=True, description="Whether the field can be null")
-    sample_value: Optional[Any] = Field(default=None, description="Example value from mock data")
+    sample_value: Optional[str] = Field(default=None, description="Example value from mock data (as string)")
     nested_path: str = Field(description="Dot-notation path to this field (e.g., 'candidate.address.city')")
     description: Optional[str] = Field(default=None, description="Inferred description of what this field contains")
     anomalies: list[str] = Field(default_factory=list, description="Detected naming/format anomalies")
