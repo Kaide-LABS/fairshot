@@ -90,7 +90,7 @@ def _get_field_samples(schema_file_path: str, entity_name: str) -> str:
 
     Args:
         schema_file_path: Path to the original ATS schema JSON file.
-        entity_name: The entity key (e.g., 'WD_Candidate_Profile').
+        entity_name: The entity key (e.g., 'Candidate').
     """
     try:
         with open(schema_file_path, "r", encoding="utf-8") as f:
@@ -136,12 +136,12 @@ the primary mapping target), find the best matching ATS source field:
   candidate, `req` = requisition, `edu` = education, `exp` = experience, \
   `mgr` = manager.
 - **Nested paths**: Map nested ATS fields to nested Fairshot fields. E.g., \
-  `WD_Candidate_Profile.address_block.addr_city_nm` → `location.city`.
+  `Candidate.Contact_Data.Location_Data.City` → `location.city`.
 - **Array items**: Map array sub-fields individually. E.g., \
-  `education_history[].edu_institution_nm` → `education[].institution`.
-- **Enum translation**: When ATS uses codes (e.g., `LINKEDIN_APPLY`) and \
-  Fairshot uses lowercase (e.g., `linkedin`), note the transform needed.
-- **Date format normalization**: When ATS uses `MM/DD/YYYY` or epoch seconds \
+  `Resume_Data.Education_Data[].School_Name` → `education[].institution`.
+- **Enum translation**: When ATS uses codes (e.g., `Careers_Page`) and \
+  Fairshot uses lowercase (e.g., `careers_page`), note the transform needed.
+- **Date format normalization**: When ATS uses `dateTime` or other formats \
   and Fairshot expects ISO 8601, note the transform needed.
 - **Skip deprecated/legacy fields**: Fields with `_DEPRECATED`, `_DO_NOT_USE`, \
   or `_LEGACY` suffixes should NOT be mapped if a non-deprecated alternative \

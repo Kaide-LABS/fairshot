@@ -120,7 +120,7 @@ class TestGetFieldSamples:
 
     def test_returns_smartrecruiters_samples(self):
         result = _get_field_samples(
-            "src/mock_data/smartrecruiters_schema.json", "sr_candidates"
+            "src/mock_data/smartrecruiters_schema.json", "candidates"
         )
         samples = json.loads(result)
         assert isinstance(samples, list)

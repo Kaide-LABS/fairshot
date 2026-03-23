@@ -34,11 +34,11 @@ class EntityRelationship(BaseModel):
 class SchemaReport(BaseModel):
     """Complete report from the Schema Explorer agent."""
     ats_name: str = Field(description="Name of the ATS system (e.g., 'Workday Enterprise')")
-    endpoints: list[str] = Field(description="Discovered API endpoints or table names")
-    fields: list[ATSField] = Field(description="All discovered fields across all endpoints")
+    endpoints: list[str] = Field(default_factory=list, description="Discovered API endpoints or table names")
+    fields: list[ATSField] = Field(default_factory=list, description="All discovered fields across all endpoints")
     relationships: list[EntityRelationship] = Field(default_factory=list)
-    total_field_count: int
-    nesting_depth: int = Field(description="Maximum nesting depth observed")
+    total_field_count: int = Field(default=0, description="Total number of fields discovered")
+    nesting_depth: int = Field(default=0, description="Maximum nesting depth observed")
     custom_conventions: list[str] = Field(
         default_factory=list,
         description="Detected naming conventions (e.g., '_v3_Final suffix pattern')"

@@ -11,7 +11,7 @@ import logging
 import os
 from typing import Any
 
-from agents import Agent, function_tool
+from agents import Agent, AgentOutputSchema, function_tool
 from jinja2 import Environment, FileSystemLoader
 
 from src.models import (
@@ -230,7 +230,7 @@ def _load_sample_record(schema_file_path: str, entity_name: str) -> str:
 
     Args:
         schema_file_path: Path to the ATS schema JSON file.
-        entity_name: The entity key (e.g., 'WD_Candidate_Profile').
+        entity_name: The entity key (e.g., 'Candidate').
     """
     try:
         with open(schema_file_path, "r", encoding="utf-8") as f:
@@ -295,7 +295,13 @@ transform operation. A deterministic template renders the final Python.
 | `json_string_to_list` | (none) | '["a"]' → ["a"] |
 | `phone_to_e164` | (none) | Strip non-numeric except leading + |
 | `numeric_enum` | `enum_map` (dict) | Map int codes to strings |
-| `custom` | `code` (str) | Raw Python (escape hatch — use sparingly) |
+| `custom` | `code` (str) | Raw Python (escape hatch — use sparingly, NO imports allowed) |
+
+## IMPORTANT CONSTRAINTS
+- Do NOT use `custom` transform type unless absolutely necessary.
+- Do NOT add any import statements or references to `src` in custom_code_blocks.
+- Keep custom_code_blocks EMPTY in almost all cases — the predefined transforms cover 99% of needs.
+- The generated code runs in an isolated sandbox with NO access to external modules.
 
 ## Array Field Handling
 
@@ -357,6 +363,6 @@ def create_code_generator() -> Agent:
         name="Code Generator",
         instructions=CODE_GENERATOR_INSTRUCTIONS,
         tools=[render_middleware, run_test, validate_gemini, load_sample],
-        output_type=TransformSpec,
+        output_type=AgentOutputSchema(TransformSpec, strict_json_schema=False),
         model="gpt-5.3-codex",
     )

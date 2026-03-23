@@ -1,307 +1,388 @@
 {
   "ats_name": "Workday Enterprise HCM",
-  "ats_version": "2024.R2.3.1-patch4",
-  "api_base": "/ccx/api/v1",
+  "ats_version": "v38.1",
+  "api_base": "/ccx/api/recruiting/v38.1",
   "auth_type": "OAuth2_SAML",
   "entities": {
-    "WD_Candidate_Profile": {
-      "endpoint": "/ccx/api/v1/recruiting/candidates",
-      "description": "Core candidate identity and application data",
+    "Candidate": {
+      "endpoint": "/ccx/api/recruiting/v38.1/candidates",
+      "description": "Core candidate identity, application, and resume data",
       "fields": {
-        "cand_nm_first": { "type": "string", "nullable": false, "max_length": 100 },
-        "cand_nm_last": { "type": "string", "nullable": false, "max_length": 100 },
-        "cand_nm_middle_initial": { "type": "string", "nullable": true, "max_length": 1 },
-        "cand_email_primary_v3_Final": { "type": "string", "nullable": false, "format": "email" },
-        "cand_email_secondary_DEPRECATED": { "type": "string", "nullable": true, "format": "email" },
-        "cand_phone_mobile_INTL": { "type": "string", "nullable": true, "format": "phone_intl" },
-        "cand_phone_home_LEGACY": { "type": "string", "nullable": true },
-        "Custom_Diversity_Flag_DO_NOT_USE": { "type": "boolean", "nullable": true },
-        "cand_gender_cd": { "type": "string", "nullable": true, "enum": ["M", "F", "NB", "NS"] },
-        "cand_dob_dt": { "type": "string", "nullable": true, "format": "MM/DD/YYYY" },
-        "internal_candidate_flag": { "type": "boolean", "nullable": false, "default": false },
-        "source_channel_cd": { "type": "string", "nullable": true, "enum": ["LINKEDIN_APPLY", "INDEED", "REFERRAL_INTERNAL", "CAREERS_PAGE", "AGENCY_EXT", "OTHER"] },
-        "recruiter_assigned_id": { "type": "string", "nullable": true, "format": "EMP-NNNNN" },
-        "screening_score_v2": { "type": "float", "nullable": true, "min": 0, "max": 100 },
-        "notes_txt_DEPRECATED": { "type": "string", "nullable": true },
-        "last_modified_ts": { "type": "string", "nullable": false, "format": "ISO8601" },
-        "cand_profile_url_txt": { "type": "string", "nullable": true, "format": "url" },
-        "cand_resume_blob_id": { "type": "string", "nullable": true },
-        "address_block": {
+        "Candidate_ID": { "type": "string", "nullable": false },
+        "Name_Data": {
           "type": "object",
           "fields": {
-            "addr_line1": { "type": "string", "nullable": false },
-            "addr_line2_v2": { "type": "string", "nullable": true },
-            "addr_city_nm": { "type": "string", "nullable": false },
-            "addr_state_province": { "type": "string", "nullable": false },
-            "addr_postal_cd": { "type": "string", "nullable": false },
-            "addr_country_iso": { "type": "string", "nullable": false, "format": "ISO3166-alpha2" }
+            "First_Name": { "type": "string", "nullable": false, "max_length": 100 },
+            "Last_Name": { "type": "string", "nullable": false, "max_length": 100 },
+            "Middle_Name": { "type": "string", "nullable": true },
+            "Secondary_Last_Name": { "type": "string", "nullable": true }
           }
         },
-        "education_history": {
+        "Contact_Data": {
+          "type": "object",
+          "fields": {
+            "Email_Address": { "type": "string", "nullable": false, "format": "email" },
+            "Phone_Number": { "type": "string", "nullable": true },
+            "Location_Data": {
+              "type": "object",
+              "fields": {
+                "Address_Line_1": { "type": "string", "nullable": true },
+                "City": { "type": "string", "nullable": true },
+                "Country_Reference": { "type": "string", "nullable": true, "format": "ISO_3166-1_Alpha-2", "description": "References CountryObject by ISO code" },
+                "Country_Region_Reference": { "type": "string", "nullable": true, "description": "State/province code" },
+                "Postal_Code": { "type": "string", "nullable": true }
+              }
+            },
+            "Website_Data": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "fields": {
+                  "URL_Address": { "type": "string", "nullable": false, "format": "url" }
+                }
+              }
+            }
+          }
+        },
+        "Social_Media_Account_Data": {
           "type": "array",
           "items": {
             "type": "object",
             "fields": {
-              "edu_institution_nm": { "type": "string", "nullable": false },
-              "edu_degree_type_cd": { "type": "string", "nullable": false, "enum": ["HS", "AS", "BS", "BA", "MS", "MBA", "PhD", "JD", "MD", "Other"] },
-              "edu_field_of_study": { "type": "string", "nullable": true },
-              "edu_graduation_dt": { "type": "string", "nullable": true, "format": "MM/DD/YYYY" },
-              "edu_gpa_val_LEGACY": { "type": "float", "nullable": true }
+              "Social_Network_Type_Reference": { "type": "string", "nullable": false, "description": "e.g. LinkedIn, Twitter" },
+              "Social_Network_Account_URL": { "type": "string", "nullable": false, "format": "url" }
             }
           }
         },
-        "work_experience_LEGACY": {
+        "Status_Data": {
+          "type": "object",
+          "fields": {
+            "Do_Not_Hire": { "type": "boolean", "nullable": false, "default": false },
+            "Withdrawn": { "type": "boolean", "nullable": false, "default": false }
+          }
+        },
+        "Job_Application_Data": {
           "type": "array",
           "items": {
             "type": "object",
             "fields": {
-              "exp_company_nm": { "type": "string", "nullable": false },
-              "exp_title": { "type": "string", "nullable": false },
-              "exp_start_dt": { "type": "integer", "nullable": false, "format": "epoch_seconds" },
-              "exp_end_dt": { "type": "integer", "nullable": true, "format": "epoch_seconds" },
-              "exp_description_txt": { "type": "string", "nullable": true },
-              "exp_location_cd": { "type": "string", "nullable": true }
+              "Job_Requisition_Reference": { "type": "string", "nullable": false, "format": "WID", "description": "References Job_Requisition_EnabledObject" },
+              "Job_Application_Date": { "type": "string", "nullable": false, "format": "dateTime" },
+              "Stage_Reference": { "type": "string", "nullable": true, "description": "Recruiting stage WID" },
+              "Disposition_Reference": { "type": "string", "nullable": true },
+              "Status_Timestamp": { "type": "string", "nullable": true, "format": "dateTime" },
+              "Source_Reference": { "type": "string", "nullable": true, "description": "Applicant source (LinkedIn, Indeed, etc.)" },
+              "Referred_By_Worker_Reference": { "type": "string", "nullable": true, "format": "Employee_ID" },
+              "Personal_Information_Data": {
+                "type": "object",
+                "fields": {
+                  "Gender_Reference": { "type": "string", "nullable": true, "enum": ["Male", "Female", "Not_Declared"] },
+                  "Hispanic_or_Latino": { "type": "boolean", "nullable": true },
+                  "Disability_Status_Reference": { "type": "string", "nullable": true }
+                }
+              }
             }
           }
         },
-        "Custom_Req_ID_v3_Final": { "type": "string", "nullable": false, "format": "REQ-YYYY-NNNN" },
-        "application_status_cd": { "type": "string", "nullable": false, "enum": ["NEW", "SCREENING", "ACTIVE_REVIEW", "INTERVIEW_SCHEDULED", "OFFER_EXTENDED", "HIRED", "REJECTED", "WITHDRAWN"] },
-        "application_submitted_dt": { "type": "string", "nullable": false, "format": "MM/DD/YYYY" },
-        "cand_preferred_lang_cd": { "type": "string", "nullable": true, "format": "ISO639-1" },
-        "cand_timezone_v2_Final": { "type": "string", "nullable": true, "format": "IANA_timezone" },
-        "cand_skills_tags_txt": { "type": "string", "nullable": true, "format": "semicolon_delimited" }
+        "Resume_Data": {
+          "type": "object",
+          "fields": {
+            "Summary": { "type": "string", "nullable": true },
+            "Skill_Data": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "fields": {
+                  "Skill_Name": { "type": "string", "nullable": false }
+                }
+              }
+            },
+            "Education_Data": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "fields": {
+                  "School_Name": { "type": "string", "nullable": false },
+                  "Degree_Reference": { "type": "string", "nullable": true, "description": "Degree WID" },
+                  "Field_of_Study_Reference": { "type": "string", "nullable": true },
+                  "First_Year_Attended": { "type": "integer", "nullable": true },
+                  "Last_Year_Attended": { "type": "integer", "nullable": true },
+                  "Grade_Average": { "type": "string", "nullable": true }
+                }
+              }
+            },
+            "Experience_Data": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "fields": {
+                  "Company_Name": { "type": "string", "nullable": false },
+                  "Title": { "type": "string", "nullable": false },
+                  "Location": { "type": "string", "nullable": true },
+                  "Start_Month": { "type": "integer", "nullable": true },
+                  "Start_Year": { "type": "integer", "nullable": false },
+                  "End_Month": { "type": "integer", "nullable": true },
+                  "End_Year": { "type": "integer", "nullable": true },
+                  "Currently_Work_Here": { "type": "boolean", "nullable": false, "default": false },
+                  "Description": { "type": "string", "nullable": true }
+                }
+              }
+            }
+          }
+        },
+        "CF_Internal_Candidate_Flag": { "type": "boolean", "nullable": false, "default": false, "description": "Custom field - internal hire flag" },
+        "CF_Screening_Score_v2": { "type": "float", "nullable": true, "min": 0, "max": 100, "description": "Custom field - screening score (version 2)" },
+        "CF_Diversity_Flag_DO_NOT_USE": { "type": "boolean", "nullable": true, "description": "DEPRECATED custom field" },
+        "CF_Notes_DEPRECATED": { "type": "string", "nullable": true, "description": "Deprecated - use Candidate Comments" },
+        "CF_Preferred_Language": { "type": "string", "nullable": true, "format": "ISO639-1" },
+        "CF_Timezone_v2_Final": { "type": "string", "nullable": true, "format": "IANA_timezone" },
+        "CF_Skills_Tags": { "type": "string", "nullable": true, "format": "semicolon_delimited", "description": "Custom field - semicolon-delimited skill tags" }
       },
       "sample_records": [
         {
-          "cand_nm_first": "Jane",
-          "cand_nm_last": "Doe",
-          "cand_nm_middle_initial": "M",
-          "cand_email_primary_v3_Final": "jane.doe@email.com",
-          "cand_email_secondary_DEPRECATED": null,
-          "cand_phone_mobile_INTL": "+1-555-0123",
-          "cand_phone_home_LEGACY": null,
-          "Custom_Diversity_Flag_DO_NOT_USE": null,
-          "cand_gender_cd": "F",
-          "cand_dob_dt": "03/15/1992",
-          "internal_candidate_flag": false,
-          "source_channel_cd": "LINKEDIN_APPLY",
-          "recruiter_assigned_id": "EMP-00234",
-          "screening_score_v2": 87.5,
-          "notes_txt_DEPRECATED": "",
-          "last_modified_ts": "2024-11-15T14:30:00Z",
-          "cand_profile_url_txt": "https://linkedin.com/in/janedoe",
-          "cand_resume_blob_id": "blob-9f8e7d6c",
-          "address_block": {
-            "addr_line1": "123 Main St",
-            "addr_line2_v2": "Apt 4B",
-            "addr_city_nm": "San Francisco",
-            "addr_state_province": "CA",
-            "addr_postal_cd": "94105",
-            "addr_country_iso": "US"
+          "Candidate_ID": "CND-2024-00847",
+          "Name_Data": {
+            "First_Name": "Jane",
+            "Last_Name": "Doe",
+            "Middle_Name": "M",
+            "Secondary_Last_Name": null
           },
-          "education_history": [
+          "Contact_Data": {
+            "Email_Address": "jane.doe@email.com",
+            "Phone_Number": "+1-555-0123",
+            "Location_Data": {
+              "Address_Line_1": "742 Innovation Drive",
+              "City": "San Francisco",
+              "Country_Reference": "US",
+              "Country_Region_Reference": "US-CA",
+              "Postal_Code": "94105"
+            },
+            "Website_Data": [
+              { "URL_Address": "https://janedoe.dev" }
+            ]
+          },
+          "Social_Media_Account_Data": [
             {
-              "edu_institution_nm": "Stanford University",
-              "edu_degree_type_cd": "MS",
-              "edu_field_of_study": "Computer Science",
-              "edu_graduation_dt": "06/15/2020",
-              "edu_gpa_val_LEGACY": 3.92
+              "Social_Network_Type_Reference": "LinkedIn",
+              "Social_Network_Account_URL": "https://linkedin.com/in/janedoe"
             }
           ],
-          "work_experience_LEGACY": [
+          "Status_Data": {
+            "Do_Not_Hire": false,
+            "Withdrawn": false
+          },
+          "Job_Application_Data": [
             {
-              "exp_company_nm": "Palantir Technologies",
-              "exp_title": "Forward Deployed Engineer",
-              "exp_start_dt": 1483228800,
-              "exp_end_dt": 1704067200,
-              "exp_description_txt": "Led enterprise integrations for Fortune 500 clients across healthcare and financial services verticals.",
-              "exp_location_cd": "NYC"
+              "Job_Requisition_Reference": "JR-2024-1042",
+              "Job_Application_Date": "2024-11-15T09:30:00Z",
+              "Stage_Reference": "Interview",
+              "Disposition_Reference": null,
+              "Status_Timestamp": "2024-12-01T14:20:00Z",
+              "Source_Reference": "LinkedIn",
+              "Referred_By_Worker_Reference": null,
+              "Personal_Information_Data": {
+                "Gender_Reference": "Female",
+                "Hispanic_or_Latino": false,
+                "Disability_Status_Reference": null
+              }
+            }
+          ],
+          "Resume_Data": {
+            "Summary": "Full-stack engineer with 6 years of experience in distributed systems and React.",
+            "Skill_Data": [
+              { "Skill_Name": "Python" },
+              { "Skill_Name": "React" },
+              { "Skill_Name": "Distributed Systems" },
+              { "Skill_Name": "PostgreSQL" }
+            ],
+            "Education_Data": [
+              {
+                "School_Name": "Stanford University",
+                "Degree_Reference": "BS",
+                "Field_of_Study_Reference": "Computer Science",
+                "First_Year_Attended": 2014,
+                "Last_Year_Attended": 2018,
+                "Grade_Average": "3.8"
+              }
+            ],
+            "Experience_Data": [
+              {
+                "Company_Name": "Stripe",
+                "Title": "Senior Software Engineer",
+                "Location": "San Francisco, CA",
+                "Start_Month": 3,
+                "Start_Year": 2021,
+                "End_Month": null,
+                "End_Year": null,
+                "Currently_Work_Here": true,
+                "Description": "Led payments infrastructure team. Reduced latency by 40%."
+              },
+              {
+                "Company_Name": "Dropbox",
+                "Title": "Software Engineer",
+                "Location": "San Francisco, CA",
+                "Start_Month": 6,
+                "Start_Year": 2018,
+                "End_Month": 2,
+                "End_Year": 2021,
+                "Currently_Work_Here": false,
+                "Description": "Built file sync engine serving 700M users."
+              }
+            ]
+          },
+          "CF_Internal_Candidate_Flag": false,
+          "CF_Screening_Score_v2": 87.5,
+          "CF_Diversity_Flag_DO_NOT_USE": null,
+          "CF_Notes_DEPRECATED": null,
+          "CF_Preferred_Language": "en",
+          "CF_Timezone_v2_Final": "America/Los_Angeles",
+          "CF_Skills_Tags": "python;react;distributed-systems;postgresql"
+        },
+        {
+          "Candidate_ID": "CND-2024-01203",
+          "Name_Data": {
+            "First_Name": "Marco",
+            "Last_Name": "Bianchi",
+            "Middle_Name": null,
+            "Secondary_Last_Name": "Rossi"
+          },
+          "Contact_Data": {
+            "Email_Address": "marco.bianchi@proton.me",
+            "Phone_Number": "+39-06-555-1234",
+            "Location_Data": {
+              "Address_Line_1": "Via Roma 42",
+              "City": "Milan",
+              "Country_Reference": "IT",
+              "Country_Region_Reference": "IT-MI",
+              "Postal_Code": "20121"
+            },
+            "Website_Data": []
+          },
+          "Social_Media_Account_Data": [
+            {
+              "Social_Network_Type_Reference": "LinkedIn",
+              "Social_Network_Account_URL": "https://linkedin.com/in/marcobianchi"
             },
             {
-              "exp_company_nm": "Google",
-              "exp_title": "Software Engineer III",
-              "exp_start_dt": 1704067200,
-              "exp_end_dt": null,
-              "exp_description_txt": "Cloud infrastructure team, Kubernetes optimization.",
-              "exp_location_cd": "MTV"
+              "Social_Network_Type_Reference": "GitHub",
+              "Social_Network_Account_URL": "https://github.com/mbianchi"
             }
           ],
-          "Custom_Req_ID_v3_Final": "REQ-2024-0847",
-          "application_status_cd": "ACTIVE_REVIEW",
-          "application_submitted_dt": "10/28/2024",
-          "cand_preferred_lang_cd": "en",
-          "cand_timezone_v2_Final": "America/Los_Angeles",
-          "cand_skills_tags_txt": "Python;Kubernetes;Data Integration;SQL;System Design"
-        },
-        {
-          "cand_nm_first": "Marco",
-          "cand_nm_last": "Bianchi",
-          "cand_nm_middle_initial": null,
-          "cand_email_primary_v3_Final": "m.bianchi@proton.me",
-          "cand_email_secondary_DEPRECATED": "marco.b@oldmail.com",
-          "cand_phone_mobile_INTL": "+39-02-1234567",
-          "cand_phone_home_LEGACY": "+39-02-7654321",
-          "Custom_Diversity_Flag_DO_NOT_USE": null,
-          "cand_gender_cd": "M",
-          "cand_dob_dt": "11/02/1988",
-          "internal_candidate_flag": false,
-          "source_channel_cd": "REFERRAL_INTERNAL",
-          "recruiter_assigned_id": "EMP-00891",
-          "screening_score_v2": 72.0,
-          "notes_txt_DEPRECATED": "Referred by VP of Engineering",
-          "last_modified_ts": "2024-12-01T09:15:00Z",
-          "cand_profile_url_txt": null,
-          "cand_resume_blob_id": "blob-1a2b3c4d",
-          "address_block": {
-            "addr_line1": "Via Roma 42",
-            "addr_line2_v2": null,
-            "addr_city_nm": "Milano",
-            "addr_state_province": "MI",
-            "addr_postal_cd": "20121",
-            "addr_country_iso": "IT"
+          "Status_Data": {
+            "Do_Not_Hire": false,
+            "Withdrawn": false
           },
-          "education_history": [
+          "Job_Application_Data": [
             {
-              "edu_institution_nm": "Università Bocconi",
-              "edu_degree_type_cd": "MBA",
-              "edu_field_of_study": "Finance & Technology",
-              "edu_graduation_dt": "07/20/2015",
-              "edu_gpa_val_LEGACY": null
+              "Job_Requisition_Reference": "JR-2024-1105",
+              "Job_Application_Date": "2024-12-03T11:00:00Z",
+              "Stage_Reference": "Screen",
+              "Disposition_Reference": null,
+              "Status_Timestamp": "2024-12-10T09:15:00Z",
+              "Source_Reference": "Careers_Page",
+              "Referred_By_Worker_Reference": "EMP-00412",
+              "Personal_Information_Data": {
+                "Gender_Reference": "Male",
+                "Hispanic_or_Latino": false,
+                "Disability_Status_Reference": null
+              }
             }
           ],
-          "work_experience_LEGACY": [
-            {
-              "exp_company_nm": "McKinsey & Company",
-              "exp_title": "Associate",
-              "exp_start_dt": 1438387200,
-              "exp_end_dt": 1577836800,
-              "exp_description_txt": "Strategy consulting for financial services clients across EMEA.",
-              "exp_location_cd": "MIL"
-            }
-          ],
-          "Custom_Req_ID_v3_Final": "REQ-2024-1203",
-          "application_status_cd": "SCREENING",
-          "application_submitted_dt": "11/28/2024",
-          "cand_preferred_lang_cd": "it",
-          "cand_timezone_v2_Final": "Europe/Rome",
-          "cand_skills_tags_txt": "Financial Modeling;Strategy;M&A;Due Diligence"
+          "Resume_Data": {
+            "Summary": "Data engineer specializing in real-time streaming and ML pipelines.",
+            "Skill_Data": [
+              { "Skill_Name": "Apache Kafka" },
+              { "Skill_Name": "Spark" },
+              { "Skill_Name": "dbt" },
+              { "Skill_Name": "Snowflake" }
+            ],
+            "Education_Data": [
+              {
+                "School_Name": "Politecnico di Milano",
+                "Degree_Reference": "MS",
+                "Field_of_Study_Reference": "Data Engineering",
+                "First_Year_Attended": 2016,
+                "Last_Year_Attended": 2018,
+                "Grade_Average": "110/110 cum laude"
+              }
+            ],
+            "Experience_Data": [
+              {
+                "Company_Name": "Spotify",
+                "Title": "Senior Data Engineer",
+                "Location": "Stockholm, Sweden",
+                "Start_Month": 1,
+                "Start_Year": 2022,
+                "End_Month": null,
+                "End_Year": null,
+                "Currently_Work_Here": true,
+                "Description": "Architected real-time recommendation pipeline processing 4B events/day."
+              },
+              {
+                "Company_Name": "McKinsey & Company",
+                "Title": "Data Analyst",
+                "Location": "Milan, Italy",
+                "Start_Month": 9,
+                "Start_Year": 2018,
+                "End_Month": 12,
+                "End_Year": 2021,
+                "Currently_Work_Here": false,
+                "Description": "Built ETL pipelines for Fortune 500 client engagements."
+              }
+            ]
+          },
+          "CF_Internal_Candidate_Flag": false,
+          "CF_Screening_Score_v2": 72.0,
+          "CF_Diversity_Flag_DO_NOT_USE": null,
+          "CF_Notes_DEPRECATED": null,
+          "CF_Preferred_Language": "it",
+          "CF_Timezone_v2_Final": "Europe/Rome",
+          "CF_Skills_Tags": "kafka;spark;dbt;snowflake;python"
         }
       ]
     },
-    "WD_Job_Requisition": {
-      "endpoint": "/ccx/api/v1/recruiting/requisitions",
-      "description": "Job requisition definitions with approval workflows",
+    "Job_Requisition": {
+      "endpoint": "/ccx/api/recruiting/v38.1/requisitions",
+      "description": "Job requisition data",
       "fields": {
-        "Custom_Req_ID_v3_Final": { "type": "string", "nullable": false, "format": "REQ-YYYY-NNNN" },
-        "req_title_txt": { "type": "string", "nullable": false },
-        "req_department_cd": { "type": "string", "nullable": false },
-        "req_hiring_mgr_id": { "type": "string", "nullable": false, "format": "EMP-NNNNN" },
-        "req_location_primary": {
+        "Job_Requisition_ID": { "type": "string", "nullable": false, "format": "JR-YYYY-NNNN" },
+        "Job_Posting_Title": { "type": "string", "nullable": false },
+        "Supervisory_Organization_Reference": { "type": "string", "nullable": false, "description": "Department/org WID" },
+        "Hiring_Manager_Reference": { "type": "string", "nullable": false, "format": "Employee_ID" },
+        "Job_Profile_Reference": { "type": "string", "nullable": true, "description": "Job profile WID" },
+        "Time_Type_Reference": { "type": "string", "nullable": false, "enum": ["Full_Time", "Part_Time"] },
+        "Worker_Type_Reference": { "type": "string", "nullable": false, "enum": ["Employee", "Contingent_Worker", "Intern"] },
+        "Management_Level_Reference": { "type": "string", "nullable": true, "enum": ["Individual_Contributor", "Manager", "Director", "VP", "Executive"] },
+        "Job_Description_Summary": { "type": "string", "nullable": true },
+        "Recruiting_Status": { "type": "string", "nullable": false, "enum": ["Draft", "Open", "Frozen", "Filled", "Closed_Not_Filled"] },
+        "Created_Moment": { "type": "string", "nullable": false, "format": "dateTime" },
+        "Last_Updated": { "type": "string", "nullable": false, "format": "dateTime" },
+        "Primary_Location_Reference": {
           "type": "object",
           "fields": {
-            "loc_city_nm": { "type": "string", "nullable": false },
-            "loc_state_province": { "type": "string", "nullable": true },
-            "loc_country_iso": { "type": "string", "nullable": false, "format": "ISO3166-alpha2" }
+            "Location_Name": { "type": "string", "nullable": false },
+            "Country_Reference": { "type": "string", "nullable": false, "format": "ISO_3166-1_Alpha-2" }
           }
-        },
-        "req_employment_type_cd": { "type": "string", "nullable": false, "enum": ["FT", "PT", "CT", "IN"] },
-        "req_seniority_band_cd": { "type": "string", "nullable": false, "enum": ["IC1", "IC2", "IC3", "IC4", "MGR1", "MGR2", "DIR", "VP", "EXEC"] },
-        "req_skills_required_txt": { "type": "string", "nullable": true, "format": "semicolon_delimited" },
-        "req_description_html": { "type": "string", "nullable": true, "format": "html" },
-        "req_status_cd": { "type": "string", "nullable": false, "enum": ["DRAFT", "OPEN", "ON_HOLD", "FILLED", "CANCELLED"] },
-        "req_created_dt": { "type": "string", "nullable": false, "format": "YYYY-MM-DD" },
-        "req_updated_ts": { "type": "string", "nullable": false, "format": "ISO8601" },
-        "req_headcount_approved_v2": { "type": "integer", "nullable": false, "default": 1 },
-        "req_comp_range_min_LEGACY": { "type": "float", "nullable": true },
-        "req_comp_range_max_LEGACY": { "type": "float", "nullable": true },
-        "req_comp_currency_cd": { "type": "string", "nullable": true, "format": "ISO4217" }
-      },
-      "sample_records": [
-        {
-          "Custom_Req_ID_v3_Final": "REQ-2024-0847",
-          "req_title_txt": "Senior Forward Deployed Engineer",
-          "req_department_cd": "ENG-PLATFORM",
-          "req_hiring_mgr_id": "EMP-00102",
-          "req_location_primary": {
-            "loc_city_nm": "New York",
-            "loc_state_province": "NY",
-            "loc_country_iso": "US"
-          },
-          "req_employment_type_cd": "FT",
-          "req_seniority_band_cd": "IC3",
-          "req_skills_required_txt": "Python;Data Integration;System Design;SQL;Kubernetes",
-          "req_description_html": "<p>Join our platform team to lead enterprise integrations...</p>",
-          "req_status_cd": "OPEN",
-          "req_created_dt": "2024-09-15",
-          "req_updated_ts": "2024-11-15T14:30:00Z",
-          "req_headcount_approved_v2": 2,
-          "req_comp_range_min_LEGACY": 180000.00,
-          "req_comp_range_max_LEGACY": 260000.00,
-          "req_comp_currency_cd": "USD"
-        },
-        {
-          "Custom_Req_ID_v3_Final": "REQ-2024-1203",
-          "req_title_txt": "Strategy & Operations Manager",
-          "req_department_cd": "BIZ-OPS",
-          "req_hiring_mgr_id": "EMP-00045",
-          "req_location_primary": {
-            "loc_city_nm": "London",
-            "loc_state_province": null,
-            "loc_country_iso": "GB"
-          },
-          "req_employment_type_cd": "FT",
-          "req_seniority_band_cd": "MGR1",
-          "req_skills_required_txt": "Strategy;Financial Modeling;Stakeholder Management",
-          "req_description_html": "<p>Drive operational excellence across our EMEA expansion...</p>",
-          "req_status_cd": "OPEN",
-          "req_created_dt": "2024-11-01",
-          "req_updated_ts": "2024-12-01T09:00:00Z",
-          "req_headcount_approved_v2": 1,
-          "req_comp_range_min_LEGACY": 95000.00,
-          "req_comp_range_max_LEGACY": 130000.00,
-          "req_comp_currency_cd": "GBP"
         }
-      ]
-    },
-    "WD_Application_Workflow": {
-      "endpoint": "/ccx/api/v1/recruiting/applications",
-      "description": "Links candidates to requisitions with status tracking",
-      "fields": {
-        "app_id_sys": { "type": "string", "nullable": false, "format": "APP-NNNNNNN" },
-        "cand_email_primary_v3_Final": { "type": "string", "nullable": false, "format": "email" },
-        "Custom_Req_ID_v3_Final": { "type": "string", "nullable": false, "format": "REQ-YYYY-NNNN" },
-        "application_status_cd": { "type": "string", "nullable": false, "enum": ["NEW", "SCREENING", "ACTIVE_REVIEW", "INTERVIEW_SCHEDULED", "OFFER_EXTENDED", "HIRED", "REJECTED", "WITHDRAWN"] },
-        "app_submitted_ts": { "type": "string", "nullable": false, "format": "ISO8601" },
-        "app_last_action_ts": { "type": "string", "nullable": false, "format": "ISO8601" },
-        "app_stage_history_v2": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "fields": {
-              "stage_cd": { "type": "string" },
-              "entered_ts": { "type": "string", "format": "ISO8601" },
-              "exited_ts": { "type": "string", "nullable": true, "format": "ISO8601" }
-            }
-          }
-        },
-        "app_rejection_reason_cd_LEGACY": { "type": "string", "nullable": true },
-        "app_offer_amount_LEGACY": { "type": "float", "nullable": true }
       },
       "sample_records": [
         {
-          "app_id_sys": "APP-0034821",
-          "cand_email_primary_v3_Final": "jane.doe@email.com",
-          "Custom_Req_ID_v3_Final": "REQ-2024-0847",
-          "application_status_cd": "ACTIVE_REVIEW",
-          "app_submitted_ts": "2024-10-28T16:45:00Z",
-          "app_last_action_ts": "2024-11-15T14:30:00Z",
-          "app_stage_history_v2": [
-            { "stage_cd": "NEW", "entered_ts": "2024-10-28T16:45:00Z", "exited_ts": "2024-10-29T09:00:00Z" },
-            { "stage_cd": "SCREENING", "entered_ts": "2024-10-29T09:00:00Z", "exited_ts": "2024-11-05T11:30:00Z" },
-            { "stage_cd": "ACTIVE_REVIEW", "entered_ts": "2024-11-05T11:30:00Z", "exited_ts": null }
-          ],
-          "app_rejection_reason_cd_LEGACY": null,
-          "app_offer_amount_LEGACY": null
+          "Job_Requisition_ID": "JR-2024-1042",
+          "Job_Posting_Title": "Senior Forward Deployed Engineer",
+          "Supervisory_Organization_Reference": "Engineering - Platform",
+          "Hiring_Manager_Reference": "EMP-00218",
+          "Job_Profile_Reference": "JP-SWE-SR",
+          "Time_Type_Reference": "Full_Time",
+          "Worker_Type_Reference": "Employee",
+          "Management_Level_Reference": "Individual_Contributor",
+          "Job_Description_Summary": "Work directly with enterprise clients to deploy and customize the Fairshot platform.",
+          "Recruiting_Status": "Open",
+          "Created_Moment": "2024-10-01T08:00:00Z",
+          "Last_Updated": "2024-11-28T16:30:00Z",
+          "Primary_Location_Reference": {
+            "Location_Name": "San Francisco, CA",
+            "Country_Reference": "US"
+          }
         }
       ]
     }

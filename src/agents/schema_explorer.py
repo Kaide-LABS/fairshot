@@ -48,7 +48,7 @@ def _inspect_field(path: str, field_path: str) -> str:
     """
     Gets detailed info on a single field from the schema.
     path: the file path to the schema.
-    field_path: dot-notation path, e.g., 'entities.WD_Candidate_Profile.fields.cand_nm_first'
+    field_path: dot-notation path, e.g., 'entities.Candidate.fields.Candidate_ID'
     """
     try:
         if path not in _schema_cache:

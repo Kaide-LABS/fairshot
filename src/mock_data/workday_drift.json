@@ -4,15 +4,15 @@
   "changes": [
     {
       "type": "rename",
-      "entity": "WD_Candidate_Profile",
-      "old_field": "Custom_Req_ID_v3_Final",
-      "new_field": "Requisition_Reference_ID",
-      "description": "Workday deprecated the v3 custom field naming convention"
+      "entity": "Candidate",
+      "old_field": "CF_Screening_Score_v2",
+      "new_field": "Screening_Score",
+      "description": "Workday dropped the CF_ prefix convention and version suffixes in Q1 2025 field normalization"
     },
     {
       "type": "add",
-      "entity": "WD_Candidate_Profile",
-      "field": "compliance_region",
+      "entity": "Candidate",
+      "field": "Compliance_Region",
       "field_def": {
         "type": "string",
         "nullable": false,
@@ -23,13 +23,13 @@
     },
     {
       "type": "type_change",
-      "entity": "WD_Candidate_Profile",
-      "field": "cand_dob_dt",
-      "old_type": "string",
-      "old_format": "MM/DD/YYYY",
+      "entity": "Candidate",
+      "field": "Resume_Data.Experience_Data[].Start_Year",
+      "old_type": "integer",
+      "old_format": null,
       "new_type": "string",
       "new_format": "ISO8601",
-      "description": "Date format standardized to ISO 8601 across all Workday date fields"
+      "description": "Start_Year changed from integer (e.g. 2019) to ISO date string (e.g. 2019-01-01) for date arithmetic consistency"
     }
   ]
 }

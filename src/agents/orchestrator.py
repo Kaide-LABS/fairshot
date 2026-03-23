@@ -41,15 +41,15 @@ logger = logging.getLogger(__name__)
 SCHEMA_CONFIGS: dict[str, dict[str, str]] = {
     "Workday Enterprise": {
         "schema_path": "src/mock_data/workday_schema.json",
-        "entity_name": "WD_Candidate_Profile",
+        "entity_name": "Candidate",
         "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
     },
-    "SmartRecruiters Lite": {
+    "SmartRecruiters": {
         "schema_path": "src/mock_data/smartrecruiters_schema.json",
-        "entity_name": "sr_candidates",
+        "entity_name": "candidates",
         "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
     },
-    "Legacy Oracle": {
+    "Legacy Oracle HRMS": {
         "schema_path": "src/mock_data/legacy_oracle_schema.json",
         "entity_name": "HR_CANDIDATES",
         "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
@@ -141,6 +141,14 @@ async def run_pipeline(
             input=f"Analyze the schema at {schema_path}",
         )
         schema_report: SchemaReport = explore_result.final_output
+
+        # Backfill computed fields if agent didn't populate them
+        if schema_report.total_field_count == 0:
+            schema_report.total_field_count = len(schema_report.fields)
+        if schema_report.nesting_depth == 0 and schema_report.fields:
+            schema_report.nesting_depth = max(
+                f.nested_path.count('.') + 1 for f in schema_report.fields
+            )
 
         state.schema_report = schema_report.model_dump()
         _transition(
@@ -348,6 +356,14 @@ async def run_drift_repair(
             explorer, input=f"Analyze the schema at {drifted_path}"
         )
         new_schema_report: SchemaReport = explore_result.final_output
+
+        if new_schema_report.total_field_count == 0:
+            new_schema_report.total_field_count = len(new_schema_report.fields)
+        if new_schema_report.nesting_depth == 0 and new_schema_report.fields:
+            new_schema_report.nesting_depth = max(
+                f.nested_path.count('.') + 1 for f in new_schema_report.fields
+            )
+
         state.schema_report = new_schema_report.model_dump()
 
         _transition(

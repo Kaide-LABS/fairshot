@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Any, Optional
 from enum import Enum
 
 class Severity(str, Enum):
@@ -28,7 +28,7 @@ class TransformOperation(BaseModel):
     fairshot_field: str = Field(description="Target field in Fairshot API (dot-notation for nested)")
     ats_source_path: str = Field(description="Source field path in ATS record (dot-notation)")
     transform_type: str = Field(description="One of the predefined transform types")
-    params: dict = Field(
+    params: dict[str, Any] = Field(
         default_factory=dict,
         description="Transform-specific parameters (e.g., date_format, enum_map, delimiter)"
     )
