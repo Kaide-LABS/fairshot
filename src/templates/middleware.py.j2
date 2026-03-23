@@ -31,7 +31,7 @@ def _lowercase_enum(value: Any, enum_map: dict | None = None) -> str | None:
         return None
     if enum_map and str(value) in enum_map:
         return enum_map[str(value)]
-    return str(value).lower().replace("_", " ").split("_")[0] if value else None
+    return str(value).lower().replace("_", "-") if value else None
 
 
 def _date_mmddyyyy_to_iso(value: str | None) -> str | None:
@@ -88,106 +88,6 @@ def _numeric_enum(value: Any, enum_map: dict | None = None) -> str | None:
     return str(value)
 
 
-# ─── Main Transform Function ────────────────────────────────────────────
-
-def transform(record: dict) -> dict:
-    """Transform a raw {{ ats_name }} record into a Fairshot API payload."""
-    output = {}
-
-    {% for t in transforms %}
-    {% if not t.is_array_item %}
-    # {{ t.fairshot_field }} ← {{ t.ats_source_path }} ({{ t.transform_type }})
-    {% if t.transform_type == "direct_copy" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    {% if t.nullable %}
-    if _val is not None:
-        {% endif %}
-        _set_nested(output, "{{ t.fairshot_field }}", _direct_copy(_val))
-    {% elif t.transform_type == "lowercase_enum" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    if _val is not None:
-        _set_nested(output, "{{ t.fairshot_field }}", _lowercase_enum(_val, {{ t.params.get('enum_map', 'None') }}))
-    {% elif t.transform_type == "date_mmddyyyy_to_iso" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    if _val is not None:
-        _set_nested(output, "{{ t.fairshot_field }}", _date_mmddyyyy_to_iso(_val))
-    {% elif t.transform_type == "epoch_to_iso" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    if _val is not None:
-        _set_nested(output, "{{ t.fairshot_field }}", _epoch_to_iso(_val))
-    {% elif t.transform_type == "nested_extract" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    if _val is not None:
-        _set_nested(output, "{{ t.fairshot_field }}", _val)
-    {% elif t.transform_type == "semicolon_to_list" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    _set_nested(output, "{{ t.fairshot_field }}", _semicolon_to_list(_val))
-    {% elif t.transform_type == "json_string_to_list" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    _set_nested(output, "{{ t.fairshot_field }}", _json_string_to_list(_val))
-    {% elif t.transform_type == "phone_to_e164" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    if _val is not None:
-        _set_nested(output, "{{ t.fairshot_field }}", _phone_to_e164(_val))
-    {% elif t.transform_type == "numeric_enum" %}
-    _val = _safe_get(record, "{{ t.ats_source_path }}")
-    if _val is not None:
-        _set_nested(output, "{{ t.fairshot_field }}", _numeric_enum(_val, {{ t.params.get('enum_map', 'None') }}))
-    {% elif t.transform_type == "custom" %}
-    # Custom transform
-    {{ t.params.get('code', 'pass') }}
-    {% endif %}
-
-    {% endif %}
-    {% endfor %}
-
-    # ─── Array Transforms ────────────────────────────────────────────
-    {% set array_groups = {} %}
-    {% for t in transforms if t.is_array_item %}
-    {% if t.array_target_path not in array_groups %}
-    {% set _ = array_groups.update({t.array_target_path: []}) %}
-    {% endif %}
-    {% set _ = array_groups[t.array_target_path].append(t) %}
-    {% endfor %}
-
-    {% for target_array, items in array_groups.items() %}
-    # Array: {{ items[0].array_source_path }} → {{ target_array }}
-    _source_arr = _safe_get(record, "{{ items[0].array_source_path }}", [])
-    if isinstance(_source_arr, list):
-        _target_arr = []
-        for _item in _source_arr:
-            _mapped = {}
-            {% for t in items %}
-            # {{ t.fairshot_field }} ← {{ t.ats_source_path }}
-            {% set field_key = t.ats_source_path.split(".")[-1] %}
-            _arr_val = _item.get("{{ field_key }}")
-            {% if t.transform_type == "direct_copy" %}
-            if _arr_val is not None:
-                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _direct_copy(_arr_val)
-            {% elif t.transform_type == "date_mmddyyyy_to_iso" %}
-            if _arr_val is not None:
-                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _date_mmddyyyy_to_iso(_arr_val)
-            {% elif t.transform_type == "epoch_to_iso" %}
-            if _arr_val is not None:
-                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _epoch_to_iso(_arr_val)
-            {% elif t.transform_type == "lowercase_enum" %}
-            if _arr_val is not None:
-                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _lowercase_enum(_arr_val, {{ t.params.get('enum_map', 'None') }})
-            {% endif %}
-            {% endfor %}
-            _target_arr.append(_mapped)
-        output["{{ target_array }}"] = _target_arr
-
-    {% endfor %}
-
-    {% for block in custom_code_blocks %}
-    # Custom code block
-    {{ block }}
-    {% endfor %}
-
-    return output
-
-
 def _set_nested(d: dict, path: str, value: Any) -> None:
     """Set a value in a nested dict using dot-notation path."""
     keys = path.split(".")
@@ -196,3 +96,78 @@ def _set_nested(d: dict, path: str, value: Any) -> None:
             d[key] = {}
         d = d[key]
     d[keys[-1]] = value
+
+
+def _apply_transform(value: Any, transform_type: str, params: dict | None = None) -> Any:
+    """Apply a named transform to a value."""
+    if params is None:
+        params = {}
+    if transform_type == "direct_copy":
+        return _direct_copy(value)
+    elif transform_type == "lowercase_enum":
+        return _lowercase_enum(value, params.get("enum_map"))
+    elif transform_type == "date_mmddyyyy_to_iso":
+        return _date_mmddyyyy_to_iso(value)
+    elif transform_type == "epoch_to_iso":
+        return _epoch_to_iso(value)
+    elif transform_type == "nested_extract":
+        return value
+    elif transform_type == "semicolon_to_list":
+        return _semicolon_to_list(value)
+    elif transform_type == "json_string_to_list":
+        return _json_string_to_list(value)
+    elif transform_type == "phone_to_e164":
+        return _phone_to_e164(value)
+    elif transform_type == "numeric_enum":
+        return _numeric_enum(value, params.get("enum_map"))
+    else:
+        return value
+
+
+# ─── Main Transform Function ────────────────────────────────────────────
+
+def transform(record: dict) -> dict:
+    """Transform a raw {{ ats_name }} record into a Fairshot API payload."""
+    output = {}
+
+    # ─── Scalar Transforms ───────────────────────────────────────────
+{% for t in transforms %}
+{% if not t.is_array_item %}
+    _val = _safe_get(record, "{{ t.ats_source_path }}")
+{% if t.nullable %}
+    if _val is not None:
+        _set_nested(output, "{{ t.fairshot_field }}", _apply_transform(_val, "{{ t.transform_type }}", {{ t.params | tojson }}))
+{% else %}
+    _set_nested(output, "{{ t.fairshot_field }}", _apply_transform(_val, "{{ t.transform_type }}", {{ t.params | tojson }}))
+{% endif %}
+{% endif %}
+{% endfor %}
+
+    # ─── Array Transforms ────────────────────────────────────────────
+{% set array_groups = {} %}
+{% for t in transforms if t.is_array_item %}
+{% if t.array_target_path not in array_groups %}
+{% set _ = array_groups.update({t.array_target_path: []}) %}
+{% endif %}
+{% set _ = array_groups[t.array_target_path].append(t) %}
+{% endfor %}
+{% for target_array, items in array_groups.items() %}
+    _source_arr = _safe_get(record, "{{ items[0].array_source_path }}", [])
+    if isinstance(_source_arr, list):
+        _target_arr = []
+        for _item in _source_arr:
+            _mapped = {}
+{% for t in items %}
+            _arr_val = _item.get("{{ t.ats_source_path.split('.')[-1] }}")
+            if _arr_val is not None:
+                _mapped["{{ t.fairshot_field.split('.')[-1] }}"] = _apply_transform(_arr_val, "{{ t.transform_type }}", {{ t.params | tojson }})
+{% endfor %}
+            _target_arr.append(_mapped)
+        output["{{ target_array }}"] = _target_arr
+{% endfor %}
+
+{% for block in custom_code_blocks %}
+    {{ block }}
+{% endfor %}
+
+    return output

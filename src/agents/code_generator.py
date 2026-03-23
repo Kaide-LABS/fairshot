@@ -314,6 +314,19 @@ For array fields like education and experience:
 - The `fairshot_field` should include the array prefix \
   (e.g., `education.institution`)
 
+## CRITICAL: Nested Field Paths
+
+For nested ATS schemas, use dot-notation in `ats_source_path` to traverse \
+nested objects. The middleware uses `_safe_get(record, path)` which splits \
+on `.` to navigate nested dicts. Examples:
+- `Name_Data.First_Name` — gets `record["Name_Data"]["First_Name"]`
+- `Contact_Data.Location_Data.City` — gets `record["Contact_Data"]["Location_Data"]["City"]`
+- `CF_Skills_Tags` — gets `record["CF_Skills_Tags"]` (top-level custom field)
+
+You MUST create a TransformOperation for EVERY scalar FieldMapping in the \
+MappingDocument. Do NOT skip scalar fields. Arrays (education, experience) \
+use `is_array_item=true` but ALL other fields use `is_array_item=false`.
+
 ## TransformSpec JSON Format
 
 ```json
@@ -322,7 +335,27 @@ For array fields like education and experience:
     "transforms": [
         {
             "fairshot_field": "first_name",
-            "ats_source_path": "cand_nm_first",
+            "ats_source_path": "Name_Data.First_Name",
+            "transform_type": "direct_copy",
+            "params": {},
+            "is_array_item": false,
+            "array_source_path": "",
+            "array_target_path": "",
+            "nullable": true
+        },
+        {
+            "fairshot_field": "email",
+            "ats_source_path": "Contact_Data.Email_Address",
+            "transform_type": "direct_copy",
+            "params": {},
+            "is_array_item": false,
+            "array_source_path": "",
+            "array_target_path": "",
+            "nullable": false
+        },
+        {
+            "fairshot_field": "location.city",
+            "ats_source_path": "Contact_Data.Location_Data.City",
             "transform_type": "direct_copy",
             "params": {},
             "is_array_item": false,
@@ -332,11 +365,11 @@ For array fields like education and experience:
         },
         {
             "fairshot_field": "education.institution",
-            "ats_source_path": "edu_institution_nm",
+            "ats_source_path": "School_Name",
             "transform_type": "direct_copy",
             "params": {},
             "is_array_item": true,
-            "array_source_path": "education_history",
+            "array_source_path": "Resume_Data.Education_Data",
             "array_target_path": "education",
             "nullable": true
         }
