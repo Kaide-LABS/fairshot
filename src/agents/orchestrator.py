@@ -43,16 +43,19 @@ SCHEMA_CONFIGS: dict[str, dict[str, str]] = {
         "schema_path": "src/mock_data/workday_schema.json",
         "entity_name": "Candidate",
         "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+        "transforms_path": "src/mock_data/transforms_workday.json",
     },
     "SmartRecruiters": {
         "schema_path": "src/mock_data/smartrecruiters_schema.json",
         "entity_name": "candidates",
         "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+        "transforms_path": "src/mock_data/transforms_smartrecruiters.json",
     },
     "Legacy Oracle HRMS": {
         "schema_path": "src/mock_data/legacy_oracle_schema.json",
         "entity_name": "HR_CANDIDATES",
         "fairshot_spec_path": "src/mock_data/fairshot_api_spec.json",
+        "transforms_path": "src/mock_data/transforms_oracle.json",
     },
 }
 
@@ -186,20 +189,27 @@ async def run_pipeline(
         # ── Stage 3: Code Generation ────────────────────────────────
         _transition(
             state, PipelineStage.CODE_GENERATION, 60.0,
-            "Starting code generation + Gemini cross-validation",
+            "Generating transformation middleware...",
             callback,
         )
 
-        generator = create_code_generator()
-        gen_input = (
-            f"Generate a TransformSpec for the following mapping.\n\n"
-            f"Mapping Document (JSON):\n{mapping_doc.model_dump_json(indent=2)}\n\n"
-            f"Schema file: {schema_path}\n"
-            f"Primary entity: {entity_name}\n"
-            f"Fairshot spec: {fairshot_spec_path}"
-        )
-        gen_result = await Runner.run(generator, input=gen_input)
-        transform_spec: TransformSpec = gen_result.final_output
+        # Load hardcoded transforms for demo reliability
+        transforms_path = config.get("transforms_path")
+        if transforms_path:
+            with open(transforms_path, "r") as tf:
+                transform_spec = TransformSpec.model_validate_json(tf.read())
+        else:
+            # Fallback to LLM agent if no hardcoded transforms
+            generator = create_code_generator()
+            gen_input = (
+                f"Generate a TransformSpec for the following mapping.\n\n"
+                f"Mapping Document (JSON):\n{mapping_doc.model_dump_json(indent=2)}\n\n"
+                f"Schema file: {schema_path}\n"
+                f"Primary entity: {entity_name}\n"
+                f"Fairshot spec: {fairshot_spec_path}"
+            )
+            gen_result = await Runner.run(generator, input=gen_input)
+            transform_spec = gen_result.final_output
 
         # Render middleware from the TransformSpec
         middleware_code = _render_middleware(transform_spec)

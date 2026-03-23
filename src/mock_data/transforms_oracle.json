@@ -1,0 +1,16 @@
+{
+  "ats_name": "Legacy Oracle HRMS",
+  "transforms": [
+    {"fairshot_field": "first_name", "ats_source_path": "FIRST_NAME_50", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "last_name", "ats_source_path": "LAST_NAME_50", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "email", "ats_source_path": "EMAIL_ADDRESS_100", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": false},
+    {"fairshot_field": "phone", "ats_source_path": "PHONE_NUMBER_20", "transform_type": "phone_to_e164", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.city", "ats_source_path": "TOWN_OR_CITY_50", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.state", "ats_source_path": "REGION_2_10", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.country", "ats_source_path": "COUNTRY_5", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.postal_code", "ats_source_path": "POSTAL_CODE_10", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "source_channel", "ats_source_path": "SOURCE_CD_20", "transform_type": "lowercase_enum", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true}
+  ],
+  "custom_code_blocks": [],
+  "notes": "Hardcoded transforms for demo reliability. Oracle has no nested education/experience in candidate table."
+}

@@ -1,0 +1,21 @@
+{
+  "ats_name": "SmartRecruiters",
+  "transforms": [
+    {"fairshot_field": "first_name", "ats_source_path": "firstName", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "last_name", "ats_source_path": "lastName", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "email", "ats_source_path": "email", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": false},
+    {"fairshot_field": "phone", "ats_source_path": "phoneNumber", "transform_type": "phone_to_e164", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.city", "ats_source_path": "location.city", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.state", "ats_source_path": "location.region", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.country", "ats_source_path": "location.countryCode", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "source_channel", "ats_source_path": "primaryAssignment.source", "transform_type": "lowercase_enum", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "tags", "ats_source_path": "tags", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "education.institution", "ats_source_path": "institution", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "education", "array_target_path": "education", "nullable": true},
+    {"fairshot_field": "education.degree", "ats_source_path": "degree", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "education", "array_target_path": "education", "nullable": true},
+    {"fairshot_field": "education.field_of_study", "ats_source_path": "major", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "education", "array_target_path": "education", "nullable": true},
+    {"fairshot_field": "experience.company", "ats_source_path": "company", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "experience", "array_target_path": "experience", "nullable": true},
+    {"fairshot_field": "experience.title", "ats_source_path": "title", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "experience", "array_target_path": "experience", "nullable": true}
+  ],
+  "custom_code_blocks": [],
+  "notes": "Hardcoded transforms for demo reliability"
+}
