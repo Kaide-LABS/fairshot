@@ -63,6 +63,10 @@ DRIFT_CONFIGS: dict[str, str] = {
     "Workday Enterprise": "src/mock_data/workday_drift.json",
 }
 
+DRIFT_TRANSFORM_CONFIGS: dict[str, str] = {
+    "Workday Enterprise": "src/mock_data/transforms_workday_drift.json",
+}
+
 
 # ─── Pipeline State Helpers ──────────────────────────────────────────────
 
@@ -419,16 +423,23 @@ async def run_drift_repair(
             callback,
         )
 
-        generator = create_code_generator()
-        gen_input = (
-            f"Generate a TransformSpec for the following mapping.\n\n"
-            f"Mapping Document (JSON):\n{new_mapping_doc.model_dump_json(indent=2)}\n\n"
-            f"Schema file: {drifted_path}\n"
-            f"Primary entity: {entity_name}\n"
-            f"Fairshot spec: {fairshot_spec_path}"
-        )
-        gen_result = await Runner.run(generator, input=gen_input)
-        new_spec: TransformSpec = gen_result.final_output
+        # Use hardcoded drift transforms for demo reliability
+        drift_transforms_path = DRIFT_TRANSFORM_CONFIGS.get(schema_name)
+        if drift_transforms_path:
+            with open(drift_transforms_path, "r") as tf:
+                new_spec = TransformSpec.model_validate_json(tf.read())
+        else:
+            # Fallback to LLM agent if no hardcoded drift transforms
+            generator = create_code_generator()
+            gen_input = (
+                f"Generate a TransformSpec for the following mapping.\n\n"
+                f"Mapping Document (JSON):\n{new_mapping_doc.model_dump_json(indent=2)}\n\n"
+                f"Schema file: {drifted_path}\n"
+                f"Primary entity: {entity_name}\n"
+                f"Fairshot spec: {fairshot_spec_path}"
+            )
+            gen_result = await Runner.run(generator, input=gen_input)
+            new_spec = gen_result.final_output
         new_middleware = _render_middleware(new_spec)
         state.generated_middleware = new_middleware
 

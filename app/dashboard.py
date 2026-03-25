@@ -178,6 +178,15 @@ def _drain_queue():
                 state_data = msg.get("state")
                 if state_data and state_data.get("current_stage") != "error":
                     st.session_state["pipeline_complete"] = True
+                # Freeze elapsed time from pipeline's own timestamps
+                if state_data and state_data.get("started_at") and state_data.get("completed_at"):
+                    from datetime import datetime
+                    try:
+                        t0 = datetime.fromisoformat(state_data["started_at"])
+                        t1 = datetime.fromisoformat(state_data["completed_at"])
+                        st.session_state["pipeline_elapsed"] = (t1 - t0).total_seconds()
+                    except (ValueError, TypeError):
+                        pass
                 if state_data:
                     latest = state_data
             else:
@@ -335,6 +344,7 @@ with st.sidebar:
         type="secondary",
     ):
         st.session_state["drift_running"] = True
+        st.session_state["pipeline_complete"] = False
         st.session_state["pipeline_start_time"] = time.time()
         st.session_state["pipeline_elapsed"] = None
         st.session_state["state_queue"] = queue.Queue()
@@ -517,7 +527,11 @@ with tab_pipeline:
     else:
         elapsed_s = None
 
-    if current == "completed" and st.session_state.get("pipeline_elapsed") is None and elapsed_s is not None:
+    if (current == "completed"
+            and st.session_state.get("pipeline_elapsed") is None
+            and elapsed_s is not None
+            and not st.session_state.get("drift_running", False)
+            and not st.session_state.get("pipeline_running", False)):
         st.session_state["pipeline_elapsed"] = elapsed_s
 
     report = state_data.get("schema_report") if state_data else None

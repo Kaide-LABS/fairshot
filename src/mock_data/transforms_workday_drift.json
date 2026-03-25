@@ -1,0 +1,26 @@
+{
+  "ats_name": "Workday Enterprise HCM (Post-Drift)",
+  "transforms": [
+    {"fairshot_field": "first_name", "ats_source_path": "Name_Data.First_Name", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "last_name", "ats_source_path": "Name_Data.Last_Name", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "email", "ats_source_path": "Contact_Data.Email_Address", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": false},
+    {"fairshot_field": "phone", "ats_source_path": "Contact_Data.Phone_Number", "transform_type": "phone_to_e164", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.city", "ats_source_path": "Contact_Data.Location_Data.City", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.state", "ats_source_path": "Contact_Data.Location_Data.Country_Region_Reference", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.country", "ats_source_path": "Contact_Data.Location_Data.Country_Reference", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "location.postal_code", "ats_source_path": "Contact_Data.Location_Data.Postal_Code", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "source_channel", "ats_source_path": "Job_Application_Data.0.Source_Reference", "transform_type": "lowercase_enum", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "tags", "ats_source_path": "CF_Skills_Tags", "transform_type": "semicolon_to_list", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "screening_score", "ats_source_path": "Screening_Score", "transform_type": "direct_copy", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": true},
+    {"fairshot_field": "compliance_region", "ats_source_path": "Compliance_Region", "transform_type": "lowercase_enum", "params": {}, "is_array_item": false, "array_source_path": "", "array_target_path": "", "nullable": false},
+    {"fairshot_field": "education.institution", "ats_source_path": "School_Name", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "Resume_Data.Education_Data", "array_target_path": "education", "nullable": true},
+    {"fairshot_field": "education.degree", "ats_source_path": "Degree_Reference", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "Resume_Data.Education_Data", "array_target_path": "education", "nullable": true},
+    {"fairshot_field": "education.field_of_study", "ats_source_path": "Field_of_Study_Reference", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "Resume_Data.Education_Data", "array_target_path": "education", "nullable": true},
+    {"fairshot_field": "experience.company", "ats_source_path": "Company_Name", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "Resume_Data.Experience_Data", "array_target_path": "experience", "nullable": true},
+    {"fairshot_field": "experience.title", "ats_source_path": "Title", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "Resume_Data.Experience_Data", "array_target_path": "experience", "nullable": true},
+    {"fairshot_field": "experience.start_date", "ats_source_path": "Start_Year", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "Resume_Data.Experience_Data", "array_target_path": "experience", "nullable": true},
+    {"fairshot_field": "experience.description", "ats_source_path": "Description", "transform_type": "direct_copy", "params": {}, "is_array_item": true, "array_source_path": "Resume_Data.Experience_Data", "array_target_path": "experience", "nullable": true}
+  ],
+  "custom_code_blocks": [],
+  "notes": "Post-drift transforms: Screening_Score renamed from CF_Screening_Score_v2, Compliance_Region added, Start_Year now ISO string"
+}
